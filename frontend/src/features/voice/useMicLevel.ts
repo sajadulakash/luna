@@ -6,11 +6,28 @@ import { useVoiceStore } from '../../stores/voiceStore';
  *
  * Speech recognition tells us *what* was said but never how loudly, so the
  * level comes from a separate `getUserMedia` stream feeding an AnalyserNode.
- * Two consumers of the same microphone is fine — the browser mixes them — and
- * it keeps the recogniser's lifecycle independent of the meter's.
+ *
+ * Desktop browsers mix two consumers of one microphone happily. Mobile ones
+ * do not: the second stream starves the recogniser, which then starts, hears
+ * silence, times out with `no-speech` and restarts — forever, and without
+ * ever raising an error, because an empty session is indistinguishable from
+ * someone choosing not to speak. So the meter is a desktop-only enhancement.
+ * A pulsing orb is not worth trading working speech input for.
  *
  * Only ever reads the signal. Nothing here is recorded or sent anywhere.
  */
+
+/**
+ * Whether a second microphone consumer is safe here.
+ *
+ * A coarse pointer is a proxy for "mobile browser", not the cause — the real
+ * constraint is exclusive microphone access. It is the same heuristic the
+ * composer uses to decide whether a hardware keyboard is present.
+ */
+function canShareMicrophone(): boolean {
+  if (typeof window === 'undefined' || !window.matchMedia) return false;
+  return !window.matchMedia('(pointer: coarse)').matches;
+}
 export function useMicLevel() {
   const streamRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
@@ -34,6 +51,8 @@ export function useMicLevel() {
   const start = useCallback(async () => {
     if (streamRef.current || startingRef.current) return;
     if (!navigator.mediaDevices?.getUserMedia) return;
+    // The recogniser gets the microphone to itself where it has to.
+    if (!canShareMicrophone()) return;
 
     startingRef.current = true;
 

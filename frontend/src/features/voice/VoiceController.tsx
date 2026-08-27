@@ -172,7 +172,7 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
         ttsRef.current.prime();
         store.setError(null);
         store.dispatch('ARM');
-        recognition.start();
+        recognition.arm();
         return;
       }
 
@@ -211,10 +211,14 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
 
       if (store().state === 'idle') {
         store().dispatch('ARM');
-        recognition.start();
       } else if (store().state === 'speaking') {
         store().dispatch('BARGE_IN');
       }
+
+      // Every press, not only the ones that arm from idle: the machine can
+      // read as armed with a dead recogniser behind it, because the start on
+      // load happens outside a user gesture and mobile browsers refuse those.
+      recognition.arm();
 
       // The press is what starts a turn, so the orb goes live on the press
       // rather than on the first recognised word. Chrome can take a second to

@@ -26,6 +26,16 @@ const RESTART_MAX_MS = 8_000;
 const SESSION_TOO_SHORT_MS = 1_000;
 /** Give up after this many consecutive instant failures. */
 const MAX_RAPID_RESTARTS = 6;
+/**
+ * Give up after this many consecutive sessions that ran while the owner was
+ * holding the orb and produced nothing at all.
+ *
+ * A session with no results is normally just silence, which is why `no-speech`
+ * is ignored. But a run of them *during* a held press means the recogniser is
+ * receiving no audio — starved by another consumer of the microphone, or a
+ * denied input — and cycling silently forever is the worst possible response.
+ */
+const MAX_FRUITLESS_SESSIONS = 3;
 
 export function isSpeechRecognitionSupported(): boolean {
   if (typeof window === 'undefined') return false;
@@ -63,6 +73,14 @@ export function useSpeechRecognition({ onUtterance }: SpeechRecognitionCallbacks
   const restartTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rapidRestarts = useRef(0);
   const startedAt = useRef(0);
+  /** The last non-benign error code, so a give-up can name what went wrong. */
+  const lastError = useRef<string | null>(null);
+  /** Whether the owner has actually asked for the microphone yet. */
+  const gestured = useRef(false);
+  /** Whether the current session has produced any result at all. */
+  const sawResult = useRef(false);
+  /** Consecutive held sessions that ended without hearing a thing. */
+  const fruitless = useRef(0);
 
   const onUtteranceRef = useRef(onUtterance);
   onUtteranceRef.current = onUtterance;
@@ -130,6 +148,58 @@ export function useSpeechRecognition({ onUtterance }: SpeechRecognitionCallbacks
     }, WATCHDOG_MS);
   }, [teardown]);
 
+  /**
+   * Queues another attempt, backing off while attempts keep failing instantly.
+   *
+   * Never restarts synchronously: a recogniser that dies the moment it starts
+   * would recurse until the stack overflows.
+   */
+  const scheduleRestart = useCallback(() => {
+    if (!wantRunning.current) return;
+    if (useVoiceStore.getState().state === 'idle') return;
+
+    if (fruitless.current >= MAX_FRUITLESS_SESSIONS) {
+      const store = useVoiceStore.getState();
+      store.setError(
+        "The microphone is open but no sound is reaching me. Something else " +
+          'may be using it. You can still type to me.',
+      );
+      teardown();
+      store.reset();
+      return;
+    }
+
+    if (rapidRestarts.current > MAX_RAPID_RESTARTS) {
+      // It is not coming back — no speech service, no microphone, or a
+      // browser refusing to start one. Drop to idle and say so rather than
+      // spinning silently behind a listening indicator.
+      const store = useVoiceStore.getState();
+      if (gestured.current) {
+        store.setError(
+          lastError.current
+            ? `The microphone didn't start (${lastError.current}). You can still type to me.`
+            : "The microphone didn't start. You can still type to me.",
+        );
+      }
+      teardown();
+      store.reset();
+      return;
+    }
+
+    const delay = Math.min(
+      RESTART_MAX_MS,
+      RESTART_MIN_MS * 2 ** Math.max(0, rapidRestarts.current - 1),
+    );
+
+    if (restartTimer.current) clearTimeout(restartTimer.current);
+    restartTimer.current = setTimeout(() => {
+      restartTimer.current = null;
+      if (!wantRunning.current) return;
+      if (useVoiceStore.getState().state === 'idle') return;
+      startRef.current?.();
+    }, delay);
+  }, [teardown]);
+
   const handleTranscript = useCallback(
     (text: string, isFinal: boolean) => {
       const store = useVoiceStore.getState();
@@ -195,6 +265,9 @@ export function useSpeechRecognition({ onUtterance }: SpeechRecognitionCallbacks
     recognition.onresult = (event) => {
       // A result proves the session is healthy, so the backoff resets.
       rapidRestarts.current = 0;
+      lastError.current = null;
+      sawResult.current = true;
+      fruitless.current = 0;
       armWatchdog();
 
       // Only the results from this callback's index onward are new.
@@ -222,7 +295,9 @@ export function useSpeechRecognition({ onUtterance }: SpeechRecognitionCallbacks
         return;
       }
 
-      // network, audio-capture and friends: let onend restart us.
+      // network, audio-capture and friends: let onend restart us. The code is
+      // kept so that if the restarts do run out, the message can name it.
+      lastError.current = event.error;
       useVoiceStore.getState().setError(null);
     };
 
@@ -237,46 +312,64 @@ export function useSpeechRecognition({ onUtterance }: SpeechRecognitionCallbacks
       const lasted = Date.now() - startedAt.current;
       rapidRestarts.current = lasted < SESSION_TOO_SHORT_MS ? rapidRestarts.current + 1 : 0;
 
-      if (rapidRestarts.current > MAX_RAPID_RESTARTS) {
-        // It is not coming back — no speech service, or the machine is
-        // offline. Drop to idle and say so rather than spinning.
-        const store = useVoiceStore.getState();
-        store.setError('I lost the microphone. You can still type to me.');
-        teardown();
-        store.reset();
-        return;
+      // Only while capturing: outside a held press, hearing nothing is just
+      // someone not talking, which is the normal armed state.
+      if (!sawResult.current && useVoiceStore.getState().state === 'capturing') {
+        fruitless.current += 1;
       }
 
-      const delay = Math.min(
-        RESTART_MAX_MS,
-        RESTART_MIN_MS * 2 ** Math.max(0, rapidRestarts.current - 1),
-      );
-
-      if (restartTimer.current) clearTimeout(restartTimer.current);
-      restartTimer.current = setTimeout(() => {
-        restartTimer.current = null;
-        if (!wantRunning.current) return;
-        if (useVoiceStore.getState().state === 'idle') return;
-        startRef.current?.();
-      }, delay);
+      scheduleRestart();
     };
 
     recognitionRef.current = recognition;
     wantRunning.current = true;
+    sawResult.current = false;
 
     try {
       recognition.start();
       armWatchdog();
-    } catch {
-      // Chrome throws if start() races a previous instance's teardown.
+    } catch (cause) {
+      // Chrome throws when start() races a previous instance's teardown, and
+      // mobile browsers throw when it is called outside a user gesture.
+      // Neither fires onend, so without this the recogniser is dead for good:
+      // no instance, no watchdog, nothing left to restart it, and no error on
+      // screen — the orb sits there saying it is listening to nothing.
       recognitionRef.current = null;
+      lastError.current = cause instanceof Error ? cause.name : 'start failed';
+      rapidRestarts.current += 1;
+      scheduleRestart();
     }
-  }, [armWatchdog, handleTranscript, teardown]);
+  }, [armWatchdog, handleTranscript, scheduleRestart]);
 
   // `start` refers to itself through this ref so the watchdog can restart it
   // without a circular useCallback dependency.
   const startRef = useRef<(() => void) | null>(null);
   startRef.current = start;
+
+  /**
+   * Starts the recogniser from a user gesture, and re-asserts it on every
+   * press.
+   *
+   * `start` alone is not enough. The arm-on-load path runs outside a gesture,
+   * which mobile browsers refuse — leaving the machine reading as `armed`
+   * with no live recogniser behind it, so a press that only checks the state
+   * would never try again. The backoff is cleared too: a press is fresh
+   * intent, and the attempts that failed before it were the ungestured ones.
+   */
+  const arm = useCallback(() => {
+    gestured.current = true;
+    rapidRestarts.current = 0;
+    fruitless.current = 0;
+    lastError.current = null;
+
+    if (restartTimer.current) {
+      clearTimeout(restartTimer.current);
+      restartTimer.current = null;
+    }
+
+    // No-ops when an instance is already live.
+    start();
+  }, [start]);
 
   const stop = useCallback(() => {
     teardown();
@@ -284,5 +377,5 @@ export function useSpeechRecognition({ onUtterance }: SpeechRecognitionCallbacks
 
   useEffect(() => teardown, [teardown]);
 
-  return { start, stop, commitUtterance };
+  return { start, arm, stop, commitUtterance };
 }
