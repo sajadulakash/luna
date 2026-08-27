@@ -8,7 +8,7 @@ the team boss, signs in to chat, uses voice input, and manages the entire team
 calendar.
 
 The system uses React and TypeScript, FastAPI, PostgreSQL, SQLAlchemy, Alembic,
-OpenRouter chat and speech, and browser speech recognition. Luna books meetings
+OpenRouter chat, speech-to-text and text-to-speech. Luna books meetings
 herself through calendar tool-calling: she reads the team calendar, checks a
 time, books it, and messages the person she booked it with.
 
@@ -44,8 +44,10 @@ npm run dev -- --host 0.0.0.0
 - Read-back and explicit confirmation before anything is written
 - The attendee is messaged automatically when a meeting is booked
 - Spoken wall-clock times resolved in the caller's timezone, stored as UTC
-- Environment-configurable chat model, speech model, and female voice
-- Press-and-hold browser speech recognition and MP3 response playback
+- Environment-configurable chat, transcription and speech models
+- Press-and-hold recording transcribed by an OpenRouter speech model
+- Voice works in Chrome, Edge, Safari and Firefox, on desktop and mobile
+- MP3 response playback with barge-in
 - Meeting creation, conflict detection, cancellation, and rescheduling
 - Mobile-first Chat/Calendar workspaces with local HTTPS support
 

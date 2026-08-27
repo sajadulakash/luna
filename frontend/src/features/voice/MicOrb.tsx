@@ -21,7 +21,7 @@ interface MicOrbProps {
 
 const LABELS: Record<VoiceState, string> = {
   idle: 'Talk to Luna',
-  armed: 'Listening for "Luna". Tap to talk.',
+  armed: 'Ready. Hold the orb to talk.',
   capturing: 'Listening',
   thinking: 'Luna is thinking',
   speaking: 'Luna is speaking',

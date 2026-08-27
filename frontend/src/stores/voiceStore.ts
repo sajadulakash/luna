@@ -4,8 +4,8 @@ import { create } from 'zustand';
  * The voice state machine.
  *
  * Every piece of voice UI reads from this store and nothing keeps its own
- * copy. The store holds no browser objects — no SpeechRecognition, no Audio,
- * no AnalyserNode — so the whole machine is unit-testable with no microphone
+ * copy. The store holds no browser objects — no MediaRecorder, no Audio, no
+ * AnalyserNode — so the whole machine is unit-testable with no microphone
  * involved. The hooks own those objects and drive the machine from outside.
  */
 

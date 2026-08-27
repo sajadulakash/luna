@@ -19,6 +19,7 @@ class Settings:
     openrouter_base_url: str
     openrouter_chat_model: str
     openrouter_tts_model: str
+    openrouter_stt_model: str
     openrouter_voice: str
     app_url: str
     app_name: str
@@ -54,6 +55,9 @@ def get_settings() -> Settings:
         ),
         openrouter_tts_model=os.getenv(
             "OPENROUTER_TTS_MODEL", "deepgram/aura-2"
+        ),
+        openrouter_stt_model=os.getenv(
+            "OPENROUTER_STT_MODEL", "openai/gpt-4o-transcribe"
         ),
         openrouter_voice=os.getenv("OPENROUTER_VOICE", "aura-2-thalia-en"),
         app_url=os.getenv("LUNA_APP_URL", "https://localhost:5173"),

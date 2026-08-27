@@ -1,19 +1,14 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from 'react';
 import { useVoiceStore } from '../../stores/voiceStore';
-import {
-  isSpeechRecognitionSupported,
-  useSpeechRecognition,
-  voiceAvailability,
-} from './useSpeechRecognition';
+import { useVoiceCapture, voiceAvailability } from './useVoiceCapture';
 import { useTTSPlayback } from './useTTSPlayback';
-import { useMicLevel } from './useMicLevel';
 
 /**
  * Wires the hooks to the store. Renders nothing.
  *
- * All the browser objects — recognition, audio element, analyser — hang off
- * this component, so the store stays a pure state machine and the UI stays a
- * pure function of it.
+ * All the browser objects — the microphone, the recorder, the audio element —
+ * hang off this component, so the store stays a pure state machine and the UI
+ * stays a pure function of it.
  */
 
 export interface VoiceControllerHandle {
@@ -28,7 +23,7 @@ export interface VoiceControllerHandle {
 interface VoiceControllerProps {
   /** A complete request captured during one press. Send it to the chat. */
   onUtterance: (text: string) => void;
-  /** The owner's access token, for the TTS request. */
+  /** The owner's access token, for the speech requests. */
   token: string | null;
   /** True while a reply is streaming. */
   streaming: boolean;
@@ -37,14 +32,12 @@ interface VoiceControllerProps {
 export const VoiceController = forwardRef<VoiceControllerHandle, VoiceControllerProps>(
   function VoiceController({ onUtterance, token, streaming }, ref) {
     const tts = useTTSPlayback();
-    const recognition = useSpeechRecognition({ onUtterance });
-    const micLevel = useMicLevel();
+    const capture = useVoiceCapture({ onUtterance, token });
 
     const ttsRef = useRef(tts);
     ttsRef.current = tts;
-
-    const micLevelRef = useRef(micLevel);
-    micLevelRef.current = micLevel;
+    const captureRef = useRef(capture);
+    captureRef.current = capture;
 
     // --- Support detection ---------------------------------------------------
 
@@ -60,68 +53,14 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
             'localhost, and the microphone will work. Chat works either way.',
         );
       } else if (availability === 'unsupported') {
-        store.setError('Voice needs Chrome or Edge. Chat works everywhere.');
+        store.setError('This browser cannot record audio. Chat still works.');
       }
     }, []);
 
-    // --- Arm on load when permission is already granted -----------------------
-
-    useEffect(() => {
-      if (!isSpeechRecognitionSupported()) return;
-
-      let cancelled = false;
-
-      const armIfPermitted = async () => {
-        const permissions = navigator.permissions;
-        if (!permissions?.query) return;
-
-        try {
-          // The microphone permission name isn't in TypeScript's union yet.
-          const status = await permissions.query({
-            name: 'microphone' as PermissionName,
-          });
-          if (cancelled) return;
-
-          useVoiceStore
-            .getState()
-            .setPermission(status.state === 'granted' ? 'granted' : 'unknown');
-
-          if (status.state === 'granted') {
-            useVoiceStore.getState().dispatch('ARM');
-            recognition.start();
-          }
-        } catch {
-          // Firefox rejects the query outright. The owner can still tap to arm.
-        }
-      };
-
-      void armIfPermitted();
-
-      return () => {
-        cancelled = true;
-      };
-      // Runs once. `recognition.start` is stable across renders.
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
-
-    // --- Microphone level ----------------------------------------------------
-
-    useEffect(() => {
-      let previous = useVoiceStore.getState().state;
-
-      const sync = (state: typeof previous) => {
-        if (state === 'idle') micLevelRef.current.stop();
-        else void micLevelRef.current.start();
-      };
-
-      sync(previous);
-
-      return useVoiceStore.subscribe((s) => {
-        if (s.state === previous) return;
-        previous = s.state;
-        sync(s.state);
-      });
-    }, []);
+    // The microphone is never taken on page load. It is asked for on the tap
+    // that turns voice on, which is both less alarming and the only thing
+    // mobile browsers will honour — a getUserMedia outside a user gesture is
+    // refused, and used to leave the machine armed with nothing behind it.
 
     // --- Barge-in ------------------------------------------------------------
 
@@ -172,15 +111,16 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
         ttsRef.current.prime();
         store.setError(null);
         store.dispatch('ARM');
-        recognition.arm();
+        // Warm the microphone now so the first press records instantly rather
+        // than clipping its opening word.
+        void captureRef.current.acquire();
         return;
       }
 
-      recognition.stop();
+      captureRef.current.release();
       ttsRef.current.stop();
-      micLevelRef.current.stop();
       store.reset();
-    }, [recognition]);
+    }, []);
 
     const speak = useCallback(
       (text: string) => {
@@ -215,25 +155,22 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
         store().dispatch('BARGE_IN');
       }
 
-      // Every press, not only the ones that arm from idle: the machine can
-      // read as armed with a dead recogniser behind it, because the start on
-      // load happens outside a user gesture and mobile browsers refuse those.
-      recognition.arm();
-
-      // The press is what starts a turn, so the orb goes live on the press
-      // rather than on the first recognised word. Chrome can take a second to
-      // produce one, and a press with no speech would otherwise never show
-      // anything at all.
+      // The press is what starts a turn, so the orb goes live on the press.
       if (store().state === 'armed') {
         store().dispatch('WAKE_WORD');
       }
-    }, [recognition]);
+
+      // Not while thinking: a press during a reply is not a new recording.
+      if (store().state === 'capturing') {
+        void captureRef.current.startRecording();
+      }
+    }, []);
 
     const endHold = useCallback(() => {
       const store = useVoiceStore.getState();
       store.setHolding(false);
-      if (store.state === 'capturing') recognition.commitUtterance();
-    }, [recognition]);
+      if (store.state === 'capturing') captureRef.current.stopRecording();
+    }, []);
 
     useImperativeHandle(
       ref,
@@ -279,12 +216,10 @@ export const VoiceController = forwardRef<VoiceControllerHandle, VoiceController
 
     useEffect(() => {
       return () => {
-        recognition.stop();
+        captureRef.current.release();
         ttsRef.current.stop();
-        micLevelRef.current.stop();
         useVoiceStore.getState().reset();
       };
-      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     return null;

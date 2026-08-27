@@ -6,7 +6,17 @@ from datetime import datetime, timedelta, timezone
 import json
 from typing import Any
 
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import (
+    Cookie,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select, text
@@ -552,15 +562,43 @@ async def tts(body: TTSRequest) -> StreamingResponse:
     )
 
 
+# A held utterance, not a recording session. Anything larger than this is not
+# someone asking for a meeting.
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+
+
 @app.post("/api/voice/stt")
-async def stt() -> JSONResponse:
-    return JSONResponse(
-        status_code=501,
-        content={
-            "error": "browser_stt_in_use",
-            "message": "Voice input is currently transcribed by the browser.",
-        },
-    )
+async def stt(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> Any:
+    """
+    Transcribes one recorded utterance.
+
+    The browser records audio and posts it here rather than using its own
+    speech recognition: that was Chrome-only, needed a reachable Google
+    speech service, and could not share the microphone on mobile at all.
+    """
+    require_user(authorization, db)
+
+    audio = await file.read()
+    if not audio:
+        return api_error(400, "empty_audio", "That recording was empty.")
+    if len(audio) > MAX_AUDIO_BYTES:
+        return api_error(413, "audio_too_large", "That recording is too long.")
+
+    try:
+        text = await openrouter.transcribe(
+            audio,
+            file.filename or "speech.webm",
+            file.content_type or "application/octet-stream",
+        )
+    except OpenRouterError as exc:
+        status = exc.status_code if 400 <= exc.status_code < 600 else 502
+        return api_error(status, "transcription_failed", str(exc))
+
+    return {"text": text}
 
 
 @app.get("/api/meetings")

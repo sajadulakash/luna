@@ -98,6 +98,41 @@ class OpenRouterClient:
                 "tool_calls": [pending[index] for index in sorted(pending)],
             }
 
+    async def transcribe(
+        self, audio: bytes, filename: str, content_type: str
+    ) -> str:
+        """
+        Turns recorded audio into text.
+
+        A plain multipart upload rather than a streamed one: these are single
+        held utterances of a few seconds, and buffering one is cheaper than the
+        machinery of streaming it. The whole file has to reach the provider
+        before it can transcribe anyway.
+        """
+        headers = self._headers()
+        # httpx sets its own multipart boundary, so the JSON content type the
+        # other calls use has to come off or the upload is rejected.
+        headers.pop("Content-Type", None)
+
+        response = await self._client.post(
+            f"{self.settings.openrouter_base_url}/audio/transcriptions",
+            headers=headers,
+            files={"file": (filename, audio, content_type)},
+            data={"model": self.settings.openrouter_stt_model},
+        )
+        if response.status_code >= 400:
+            raise OpenRouterError(
+                await _error_detail(response), response.status_code
+            )
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise OpenRouterError("The transcription response was unreadable.") from exc
+
+        text = body.get("text") if isinstance(body, dict) else None
+        return text.strip() if isinstance(text, str) else ""
+
     async def open_tts_stream(self, text: str) -> httpx.Response:
         request = self._client.build_request(
             "POST",
