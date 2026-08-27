@@ -114,6 +114,7 @@ def seed_database() -> dict[str, int]:
             if meeting is None:
                 meeting = Meeting(user=user, title=title)
                 session.add(meeting)
+            meeting.created_by = users["rafi"]
             meeting.notes = notes
             meeting.start_at = start_at
             meeting.end_at = start_at + timedelta(minutes=duration)

@@ -10,6 +10,9 @@ class LoginRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8_000)
+    # The viewer's IANA zone, e.g. "Asia/Dhaka". Without it "4 pm" is
+    # meaningless: the server stores UTC and the user is speaking wall-clock.
+    timezone: str = Field(default="UTC", max_length=64)
 
 
 class TTSRequest(BaseModel):

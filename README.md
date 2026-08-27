@@ -8,8 +8,9 @@ the team boss, signs in to chat, uses voice input, and manages the entire team
 calendar.
 
 The system uses React and TypeScript, FastAPI, PostgreSQL, SQLAlchemy, Alembic,
-OpenRouter chat and speech, and browser speech recognition. AI calendar
-tool-calling is not connected yet, so chat and calendar actions remain separate.
+OpenRouter chat and speech, and browser speech recognition. Luna books meetings
+herself through calendar tool-calling: she reads the team calendar, checks a
+time, books it, and messages the person she booked it with.
 
 ## Demo
 
@@ -38,6 +39,11 @@ npm run dev -- --host 0.0.0.0
 - Username-based private employee chat links
 - Team-scoped boss calendar and employee-scoped calendars
 - Persistent chat history and streamed OpenRouter responses
+- Calendar tool-calling: Luna reads meetings, checks a time, and books it
+- Conflict detection offering real free slots inside working hours
+- Read-back and explicit confirmation before anything is written
+- The attendee is messaged automatically when a meeting is booked
+- Spoken wall-clock times resolved in the caller's timezone, stored as UTC
 - Environment-configurable chat model, speech model, and female voice
 - Press-and-hold browser speech recognition and MP3 response playback
 - Meeting creation, conflict detection, cancellation, and rescheduling
@@ -53,6 +59,10 @@ teams
     ├── messages
     └── meetings
 ```
+
+A meeting names two people. `user_id` is whose calendar it sits on, and
+`created_by_id` is who arranged it. When Rafi books time with Rakib, the meeting
+belongs to Rakib's calendar while still crediting Rafi as the requester.
 
 `setup_database.py` is repeatable. It creates the database when missing,
 upgrades it to the latest Alembic revision, and inserts or refreshes the dummy
@@ -81,7 +91,8 @@ luna/
 │   └── versions/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py          # FastAPI application and routes
+│   │   ├── main.py          # FastAPI routes and the tool-calling loop
+│   │   ├── tools.py         # Calendar tools Luna is allowed to call
 │   │   ├── models.py        # Database table definitions
 │   │   ├── database.py      # PostgreSQL connection
 │   │   ├── seed.py          # Development dummy data

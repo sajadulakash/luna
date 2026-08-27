@@ -2,7 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from typing import Any
 
@@ -26,13 +26,76 @@ from .schemas import (
 from .scheduling import POLICIES, fake_slots, iso, parse_iso
 from .security import access_token_for, verify_password
 from .services.openrouter import OpenRouterClient, OpenRouterError
+from .tools import TOOL_SCHEMAS, WRITE_TOOLS, execute_tool, zone
 
 
-SYSTEM_PROMPT = """You are Luna, Rafi's concise and warm scheduling assistant.
-Reply naturally in short spoken-friendly sentences. You can discuss availability
-and help plan meetings, but the model is not yet connected to calendar tools.
-Never claim that you booked, moved, cancelled, or checked the live calendar.
-Tell the user when an action still needs confirmation in the calendar."""
+# How many times the model may call tools and be given the results before we
+# stop and make it answer. A booking needs three at most (look up the person,
+# check the time, book it); anything beyond this is a loop.
+MAX_TOOL_ROUNDS = 5
+
+
+def build_system_prompt(
+    name: str, role: str, tz_name: str, roster: list[tuple[str, str]]
+) -> str:
+    """
+    Luna's instructions for one turn.
+
+    Rebuilt per request rather than kept as a constant, because the two things
+    that make her answers correct — what time it is, and who she is talking to
+    — change per request. A model with no clock cannot resolve "tomorrow at
+    4 pm" into anything.
+
+    The roster is inlined rather than exposed as a tool. Tool results are not
+    persisted between turns, so a lookup tool would be re-called on every
+    single message to rediscover the same four names — a whole extra
+    round-trip per turn to learn something that costs a line of context.
+    """
+    now = datetime.now(timezone.utc).astimezone(zone(tz_name))
+    stamp = now.strftime("%A, %d %B %Y at %I:%M %p").replace(" 0", " ")
+    who = "the boss" if role == "BOSS" else "an employee"
+    team = "\n".join(
+        f"  - {member} ({'boss' if member_role == 'BOSS' else 'employee'})"
+        for member, member_role in roster
+    )
+
+    return f"""You are Luna, a warm and concise scheduling assistant.
+
+You are speaking with {name}, who is {who}. It is currently {stamp} in
+{tz_name}. Resolve "today", "tomorrow" and "4 pm" against that.
+
+The team is:
+{team}
+
+Those are the only people you can book with. If a name is not on that list,
+say so and ask who they meant — never invent someone.
+
+You have real tools that read and write the team calendar. Use them. Never
+guess at what is already scheduled.
+
+Never narrate your own reasoning, and never mention the tools, their names or
+their results as machinery. The user sees only your reply: say what you found
+or what you did, not how you went about it.
+
+Never assume a date, a time or a duration the user has not actually given you.
+Ask for it instead. Checking a time nobody asked for wastes their turn.
+
+Every time you pass to a tool is local wall-clock in {tz_name}, formatted
+YYYY-MM-DDTHH:MM. Never send a UTC time.
+
+To book a meeting, collect four things: who it is with, what it is about,
+when it starts, and how long it runs. Ask for whatever is missing, one short
+question at a time. Then read all four back and wait for the user to confirm
+in their next message. Only call book_meeting after that confirmation — it
+writes to the calendar and messages the other person, so never call it to
+"check" anything.
+
+If a time is taken, say so plainly and offer the alternatives the tool
+returned. Once a booking succeeds, confirm it and say the other person has
+been notified.
+
+Keep replies short and spoken-friendly — this is often read aloud. Never
+claim an action a tool did not confirm."""
 
 LAN_ORIGIN = (
     r"https?://(localhost|127\.0\.0\.1"
@@ -98,6 +161,10 @@ def serialize_message(message: Message) -> dict[str, Any]:
 
 
 def serialize_meeting(meeting: Meeting) -> dict[str, Any]:
+    # `user` is whose calendar this sits on; `created_by` is who arranged it.
+    # Rows written before created_by_id existed fall back to the old reading,
+    # where the two were necessarily the same person.
+    creator = meeting.created_by or meeting.user
     return {
         "id": str(meeting.id),
         "title": meeting.title,
@@ -105,10 +172,10 @@ def serialize_meeting(meeting: Meeting) -> dict[str, Any]:
         "start_at": iso(meeting.start_at),
         "end_at": iso(meeting.end_at),
         "status": meeting.status,
-        "booked_via": "OWNER" if meeting.user.role == "BOSS" else "CHAT",
+        "booked_via": "OWNER" if creator.role == "BOSS" else "CHAT",
         "requested_by": {
-            "id": str(meeting.user.id),
-            "name": meeting.user.name,
+            "id": str(creator.id),
+            "name": creator.name,
         },
     }
 
@@ -170,7 +237,7 @@ def team_meeting_statement(user: User):
     statement = (
         select(Meeting)
         .join(Meeting.user)
-        .options(joinedload(Meeting.user))
+        .options(joinedload(Meeting.user), joinedload(Meeting.created_by))
     )
     if user.role == "BOSS":
         return statement.where(User.team_id == user.team_id)
@@ -181,7 +248,7 @@ def meeting_for_boss(db: Session, boss: User, meeting_id: int) -> Meeting | None
     return db.scalar(
         select(Meeting)
         .join(Meeting.user)
-        .options(joinedload(Meeting.user))
+        .options(joinedload(Meeting.user), joinedload(Meeting.created_by))
         .where(
             Meeting.id == meeting_id,
             User.team_id == boss.team_id,
@@ -291,17 +358,27 @@ async def chat(
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
     user = require_user(authorization, db)
-    user_message = Message(
-        user_id=user.id,
-        role="USER",
-        content=body.message.strip(),
-    )
-    db.add(user_message)
+    # Plain values, not the ORM object: the generator below runs after this
+    # function returns, by which point the request-scoped session is gone.
+    user_id, user_name, user_role = user.id, user.name, user.role
+    tz_name = (body.timezone or "UTC").strip() or "UTC"
+
+    roster = [
+        (member.name, member.role)
+        for member in db.scalars(
+            select(User).where(User.team_id == user.team_id).order_by(User.name)
+        )
+    ]
+
+    db.add(Message(user_id=user_id, role="USER", content=body.message.strip()))
     db.commit()
 
-    history = recent_messages(db, user.id, limit=20)
-    upstream_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+    history = recent_messages(db, user_id, limit=20)
+    convo: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": build_system_prompt(user_name, user_role, tz_name, roster),
+        },
         *[
             {"role": message.role.lower(), "content": message.content}
             for message in history
@@ -310,10 +387,93 @@ async def chat(
 
     async def generate():
         parts: list[str] = []
+        calendar_changed = False
+
         try:
-            async for token in openrouter.stream_chat(upstream_messages):
-                parts.append(token)
-                yield sse("token", {"text": token})
+            for _ in range(MAX_TOOL_ROUNDS):
+                spoken: list[str] = []
+                tool_calls: list[dict[str, Any]] = []
+
+                async for event in openrouter.stream_chat(convo, tools=TOOL_SCHEMAS):
+                    if event["type"] == "token":
+                        spoken.append(event["text"])
+                        yield sse("token", {"text": event["text"]})
+                    elif event["type"] == "tool_calls":
+                        tool_calls = event["tool_calls"]
+
+                # No tools asked for means this was the actual answer.
+                if not tool_calls:
+                    parts.extend(spoken)
+                    break
+
+                # Anything said before a tool call is preamble — "let me just
+                # check…" — written before the model knew the answer. The real
+                # reply comes in the round after the results land, so the
+                # browser is told to drop what it has drawn so far rather than
+                # running the two together. The tool line covers the gap.
+                if spoken:
+                    yield sse("draft_reset", {})
+
+                # The model's own turn has to go back verbatim, tool calls and
+                # all, or the tool results that follow have nothing to attach to.
+                convo.append(
+                    {
+                        "role": "assistant",
+                        "content": "".join(spoken) or None,
+                        "tool_calls": tool_calls,
+                    }
+                )
+
+                for call in tool_calls:
+                    name = call["function"]["name"]
+                    yield sse("tool_start", {"name": name})
+
+                    try:
+                        arguments = json.loads(call["function"]["arguments"] or "{}")
+                    except json.JSONDecodeError:
+                        arguments = {}
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+
+                    # Off the event loop: the tools are synchronous SQLAlchemy,
+                    # and blocking here would stall every other request.
+                    result = await asyncio.to_thread(
+                        execute_tool, name, arguments, user_id, tz_name
+                    )
+                    succeeded = bool(result.get("ok", True))
+                    yield sse("tool_end", {"name": name, "ok": succeeded})
+
+                    if succeeded and name in WRITE_TOOLS:
+                        calendar_changed = True
+
+                    # A clash is a normal outcome, so the UI gets to draw it as
+                    # Luna offering times rather than as an error.
+                    if result.get("reason") == "conflict":
+                        yield sse("conflict", {"reason": "booked"})
+                    alternatives = result.get("alternatives")
+                    if alternatives:
+                        yield sse(
+                            "slots",
+                            {
+                                "slots": [
+                                    {
+                                        "start": slot["start_utc"],
+                                        "end": slot["end_utc"],
+                                        "label": slot["label"],
+                                    }
+                                    for slot in alternatives
+                                ]
+                            },
+                        )
+
+                    convo.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "name": name,
+                            "content": json.dumps(result, default=str),
+                        }
+                    )
         except asyncio.CancelledError:
             raise
         except OpenRouterError as exc:
@@ -343,9 +503,12 @@ async def chat(
             )
             return
 
+        if calendar_changed:
+            yield sse("meetings_changed", {})
+
         with SessionLocal.begin() as write_db:
             assistant_message = Message(
-                user_id=user.id,
+                user_id=user_id,
                 role="ASSISTANT",
                 content=reply,
             )
@@ -467,6 +630,7 @@ def create_meeting(
 
     meeting = Meeting(
         user_id=user.id,
+        created_by_id=user.id,
         title=body.title,
         notes=body.notes,
         start_at=start,
@@ -477,6 +641,7 @@ def create_meeting(
     db.commit()
     db.refresh(meeting)
     meeting.user = user
+    meeting.created_by = user
     return JSONResponse(status_code=201, content=serialize_meeting(meeting))
 
 

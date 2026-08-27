@@ -1,4 +1,5 @@
 import { API_BASE_URL } from '../lib/env';
+import { viewerZone } from '../lib/datetime';
 import { consumeSseStream } from '../lib/sse';
 import { apiFetch, ApiRequestError, NetworkError } from './client';
 import type { ChatMessage, ConflictReason, Slot } from './types';
@@ -18,6 +19,7 @@ export type ChatStreamEvent =
   | { type: 'slots'; slots: Slot[] }
   | { type: 'conflict'; reason: ConflictReason }
   | { type: 'meetings_changed' }
+  | { type: 'draft_reset' }
   | { type: 'message'; message: ChatMessage }
   | { type: 'error'; error: string; message: string }
   | { type: 'done' };
@@ -60,6 +62,9 @@ export function toChatEvent(event: string, data: unknown): ChatStreamEvent | nul
 
     case 'meetings_changed':
       return { type: 'meetings_changed' };
+
+    case 'draft_reset':
+      return { type: 'draft_reset' };
 
     case 'message':
       return typeof d.id === 'string'
@@ -111,7 +116,9 @@ export async function streamChat({
     res = await fetch(`${API_BASE_URL}/api/chat`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ message }),
+      // The server stores UTC, but people say "4 pm". Without the viewer's
+      // zone the model has no way to turn one into the other.
+      body: JSON.stringify({ message, timezone: viewerZone() }),
       credentials: 'include',
       signal,
     });

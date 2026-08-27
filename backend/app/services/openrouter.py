@@ -40,14 +40,30 @@ class OpenRouterClient:
         await self._client.aclose()
 
     async def stream_chat(
-        self, messages: list[dict[str, str]]
-    ) -> AsyncIterator[str]:
-        payload = {
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """
+        Streams one model turn as events.
+
+        Yields `{"type": "token"}` as text arrives, then a single
+        `{"type": "tool_calls"}` at the end if the model asked for tools.
+        Tool calls cannot be forwarded as they stream: the arguments arrive as
+        JSON split across arbitrarily many deltas, so they are only usable once
+        the turn is complete.
+        """
+        payload: dict[str, Any] = {
             "model": self.settings.openrouter_chat_model,
             "messages": messages,
             "stream": True,
             "temperature": 0.4,
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        pending: dict[int, dict[str, Any]] = {}
 
         async with self._client.stream(
             "POST",
@@ -69,9 +85,18 @@ class OpenRouterClient:
                     packet = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                text = _delta_text(packet)
+
+                delta = _delta(packet)
+                text = _delta_text(delta)
                 if text:
-                    yield text
+                    yield {"type": "token", "text": text}
+                _accumulate_tool_calls(delta, pending)
+
+        if pending:
+            yield {
+                "type": "tool_calls",
+                "tool_calls": [pending[index] for index in sorted(pending)],
+            }
 
     async def open_tts_stream(self, text: str) -> httpx.Response:
         request = self._client.build_request(
@@ -118,18 +143,61 @@ async def _error_detail(response: httpx.Response) -> str:
     return f"OpenRouter request failed ({response.status_code})."
 
 
-def _delta_text(packet: Any) -> str:
+def _delta(packet: Any) -> dict[str, Any]:
+    """The first choice's delta object, or an empty one."""
     if not isinstance(packet, dict):
-        return ""
+        return {}
     choices = packet.get("choices")
     if not isinstance(choices, list) or not choices:
-        return ""
+        return {}
     choice = choices[0]
     if not isinstance(choice, dict):
-        return ""
+        return {}
     delta = choice.get("delta")
-    if not isinstance(delta, dict):
-        return ""
+    return delta if isinstance(delta, dict) else {}
+
+
+def _accumulate_tool_calls(
+    delta: dict[str, Any], pending: dict[int, dict[str, Any]]
+) -> None:
+    """
+    Folds one delta's tool-call fragments into the calls being assembled.
+
+    Keyed by `index` rather than by position: a single turn can request
+    several tools at once, and their fragments interleave. The name arrives
+    once, the id arrives once, and `arguments` arrives as a JSON string in
+    pieces that have to be concatenated in order.
+    """
+    calls = delta.get("tool_calls")
+    if not isinstance(calls, list):
+        return
+
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+
+        index = call.get("index")
+        if not isinstance(index, int):
+            index = 0
+
+        slot = pending.setdefault(
+            index,
+            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+        )
+
+        if isinstance(call.get("id"), str) and call["id"]:
+            slot["id"] = call["id"]
+
+        function = call.get("function")
+        if not isinstance(function, dict):
+            continue
+        if isinstance(function.get("name"), str) and function["name"]:
+            slot["function"]["name"] = function["name"]
+        if isinstance(function.get("arguments"), str):
+            slot["function"]["arguments"] += function["arguments"]
+
+
+def _delta_text(delta: dict[str, Any]) -> str:
     content = delta.get("content")
     if isinstance(content, str):
         return content

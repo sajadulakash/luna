@@ -140,6 +140,13 @@ export function useChatSession({
             setDraft((prev) => (prev ? { ...prev, conflict: event.reason } : prev));
             break;
 
+          case 'draft_reset':
+            // What streamed before a tool ran was preamble. The answer that
+            // replaces it is on its way, so clear the text but keep any slots
+            // or conflict already attached to this reply.
+            setDraft((prev) => (prev ? { ...prev, content: '' } : prev));
+            break;
+
           case 'meetings_changed':
             // Luna booked something. The calendar moves without a reload.
             void queryClient.invalidateQueries({ queryKey: queryKeys.allMeetings });

@@ -59,9 +59,12 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    # Explicit foreign_keys: meetings points at users twice, so the join for
+    # "meetings on this person's calendar" has to be named.
     meetings: Mapped[list["Meeting"]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",
+        foreign_keys="Meeting.user_id",
     )
 
 
@@ -117,5 +120,17 @@ class Meeting(Base):
         nullable=False,
         server_default="CONFIRMED",
     )
+    # Who arranged it, as opposed to whose calendar it lands on. Nullable
+    # because meetings created before this column existed have no answer, and
+    # SET NULL because deleting the booker must not delete the meeting.
+    created_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
-    user: Mapped[User] = relationship(back_populates="meetings")
+    user: Mapped[User] = relationship(
+        back_populates="meetings",
+        foreign_keys=[user_id],
+    )
+    created_by: Mapped[User | None] = relationship(foreign_keys=[created_by_id])
