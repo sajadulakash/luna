@@ -1,0 +1,28 @@
+# Local environment and secrets.
+.env
+.env.local
+.env.*
+!.env.example
+
+# Local HTTPS certificates and private keys.
+frontend/certs/
+
+# Installed dependencies and the root Python environment.
+/.venv/
+node_modules/
+
+# Generated builds, caches, and test output.
+dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local editor and operating-system files.
+.DS_Store
+.idea/
+.vscode/

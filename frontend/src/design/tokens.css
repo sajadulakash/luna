@@ -1,0 +1,33 @@
+/* Luna design tokens — §6 of the brief.
+   Every colour in the app comes through one of these. Raw Tailwind palette
+   classes (bg-slate-800 and friends) are not used anywhere in components. */
+
+:root {
+  --bg:          #F5F6F4;
+  --surface:     #FFFFFF;
+  --surface-2:   #ECEEEB;
+  --ink:         #1A1D1C;
+  --muted:       #5F6560;
+  --faint:       #8B918B;
+  --line:        #DCDFDA;
+  --accent:      #2F6E73;   /* Luna, primary actions, focus rings */
+  --accent-soft: #E2EEEE;   /* her message bubbles */
+  --busy:        #A9452C;   /* taken slots, conflicts */
+  --free:        #3D6B4E;   /* open slots, confirmations */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:          #101315;
+    --surface:     #171B1E;
+    --surface-2:   #1F2427;
+    --ink:         #E6E8E5;
+    --muted:       #9AA19B;
+    --faint:       #6E756F;
+    --line:        #2A3033;
+    --accent:      #6FB3B3;
+    --accent-soft: #1C2E30;
+    --busy:        #E08161;
+    --free:        #7FB394;
+  }
+}
