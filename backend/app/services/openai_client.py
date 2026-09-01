@@ -1,4 +1,4 @@
-"""Minimal async OpenRouter client for chat streaming and speech synthesis."""
+"""Minimal async OpenAI client for chat streaming, transcription and speech."""
 
 from collections.abc import AsyncIterator
 import json
@@ -9,32 +9,37 @@ import httpx
 from ..config import Settings
 
 
-class OpenRouterError(RuntimeError):
+class OpenAIError(RuntimeError):
     def __init__(self, message: str, status_code: int = 502):
         super().__init__(message)
         self.status_code = status_code
 
 
-class OpenRouterClient:
+class OpenAIClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15))
 
     @property
     def configured(self) -> bool:
-        return bool(self.settings.openrouter_api_key)
+        return bool(self.settings.openai_api_key)
 
     def _headers(self) -> dict[str, str]:
         if not self.configured:
-            raise OpenRouterError(
-                "OPENROUTER_API_KEY is missing from the root .env file.", 503
+            raise OpenAIError(
+                "OPENAI_API_KEY is missing from the root .env file.", 503
             )
-        return {
-            "Authorization": f"Bearer {self.settings.openrouter_api_key}",
+        headers = {
+            "Authorization": f"Bearer {self.settings.openai_api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": self.settings.app_url,
-            "X-Title": self.settings.app_name,
         }
+        # Only needed for keys that belong to several organisations or
+        # projects. A project-scoped key already carries both.
+        if self.settings.openai_org_id:
+            headers["OpenAI-Organization"] = self.settings.openai_org_id
+        if self.settings.openai_project_id:
+            headers["OpenAI-Project"] = self.settings.openai_project_id
+        return headers
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -54,7 +59,7 @@ class OpenRouterClient:
         the turn is complete.
         """
         payload: dict[str, Any] = {
-            "model": self.settings.openrouter_chat_model,
+            "model": self.settings.openai_chat_model,
             "messages": messages,
             "stream": True,
             "temperature": 0.4,
@@ -67,13 +72,13 @@ class OpenRouterClient:
 
         async with self._client.stream(
             "POST",
-            f"{self.settings.openrouter_base_url}/chat/completions",
+            f"{self.settings.openai_base_url}/chat/completions",
             headers=self._headers(),
             json=payload,
         ) as response:
             if response.status_code >= 400:
                 detail = await _error_detail(response)
-                raise OpenRouterError(detail, response.status_code)
+                raise OpenAIError(detail, response.status_code)
 
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
@@ -98,84 +103,53 @@ class OpenRouterClient:
                 "tool_calls": [pending[index] for index in sorted(pending)],
             }
 
-    async def transcribe(
-        self, audio: bytes, filename: str, content_type: str
-    ) -> str:
+    async def create_realtime_client_secret(
+        self, session: dict[str, object]
+    ) -> dict[str, object]:
         """
-        Turns recorded audio into text.
+        Mints a short-lived key for one voice conversation.
 
-        A plain multipart upload rather than a streamed one: these are single
-        held utterances of a few seconds, and buffering one is cheaper than the
-        machinery of streaming it. The whole file has to reach the provider
-        before it can transcribe anyway.
+        The browser talks straight to OpenAI over WebRTC — that is what makes
+        voice mode feel immediate, and it is why the real API key can never go
+        anywhere near it. Instead the whole session is configured here, server
+        side, and handed out as an ephemeral secret that expires in minutes and
+        can only open the session we just described.
+
+        So the model's instructions, its voice, and the tools it may call are
+        fixed at mint time by us. A tampered-with browser can spend the
+        session, but it cannot widen it.
         """
-        headers = self._headers()
-        # httpx sets its own multipart boundary, so the JSON content type the
-        # other calls use has to come off or the upload is rejected.
-        headers.pop("Content-Type", None)
-
         response = await self._client.post(
-            f"{self.settings.openrouter_base_url}/audio/transcriptions",
-            headers=headers,
-            files={"file": (filename, audio, content_type)},
-            data={"model": self.settings.openrouter_stt_model},
+            f"{self.settings.openai_base_url}/realtime/client_secrets",
+            headers=self._headers(),
+            json={"session": session},
         )
         if response.status_code >= 400:
-            raise OpenRouterError(
+            raise OpenAIError(
                 await _error_detail(response), response.status_code
             )
-
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenRouterError("The transcription response was unreadable.") from exc
-
-        text = body.get("text") if isinstance(body, dict) else None
-        return text.strip() if isinstance(text, str) else ""
-
-    async def open_tts_stream(self, text: str) -> httpx.Response:
-        request = self._client.build_request(
-            "POST",
-            f"{self.settings.openrouter_base_url}/audio/speech",
-            headers=self._headers(),
-            json={
-                "model": self.settings.openrouter_tts_model,
-                "input": text,
-                "voice": self.settings.openrouter_voice,
-                "response_format": "mp3",
-            },
-        )
-        response = await self._client.send(request, stream=True)
-        if response.status_code >= 400:
-            detail = await _error_detail(response)
-            await response.aclose()
-            raise OpenRouterError(detail, response.status_code)
-        return response
+        return response.json()
 
 
 async def _error_detail(response: httpx.Response) -> str:
+    """
+    The human-readable half of an OpenAI error body.
+
+    Shape is `{"error": {"message": ..., "type": ..., "code": ...}}`. Only the
+    message is worth showing: the rest is either the status code again or a
+    field name the caller cannot act on.
+    """
     try:
         body: Any = json.loads((await response.aread()).decode())
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return f"OpenRouter request failed ({response.status_code})."
+        return f"The OpenAI request failed ({response.status_code})."
 
     error = body.get("error") if isinstance(body, dict) else None
     if isinstance(error, dict) and isinstance(error.get("message"), str):
-        metadata = error.get("metadata")
-        if isinstance(metadata, dict) and isinstance(metadata.get("raw"), str):
-            try:
-                provider_body = json.loads(metadata["raw"])
-                provider_error = provider_body.get("error")
-                if isinstance(provider_error, dict) and isinstance(
-                    provider_error.get("message"), str
-                ):
-                    return provider_error["message"]
-            except json.JSONDecodeError:
-                pass
         return error["message"]
     if isinstance(error, str):
         return error
-    return f"OpenRouter request failed ({response.status_code})."
+    return f"The OpenAI request failed ({response.status_code})."
 
 
 def _delta(packet: Any) -> dict[str, Any]:
@@ -243,4 +217,3 @@ def _delta_text(delta: dict[str, Any]) -> str:
             if isinstance(part, dict) and isinstance(part.get("text"), str)
         )
     return ""
-

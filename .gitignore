@@ -4,8 +4,14 @@
 .env.*
 !.env.example
 
-# Local HTTPS certificates and private keys.
+# Local HTTPS certificates and private keys. The directory rule covers the
+# generated dev pair; the extension rules are the backstop, so a key written
+# anywhere else cannot be committed by accident.
 frontend/certs/
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Installed dependencies and the root Python environment.
 /.venv/
@@ -21,6 +27,8 @@ coverage/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+*.tsbuildinfo
+*.log
 
 # Local editor and operating-system files.
 .DS_Store

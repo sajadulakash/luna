@@ -233,7 +233,7 @@ def clamp_duration(value: Any) -> int:
 
 # --- Tool schemas -----------------------------------------------------------
 
-# OpenAI-style function definitions, sent to OpenRouter on every chat request.
+# OpenAI-style function definitions, sent to the API on every chat request.
 # The descriptions are load-bearing: they are the only instructions the model
 # gets about how to use these, so they say what each tool is *for* rather than
 # restating the parameter names.
@@ -339,6 +339,20 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 TOOL_NAMES = frozenset(
     schema["function"]["name"] for schema in TOOL_SCHEMAS
 )
+
+
+def realtime_tool_schemas() -> list[dict[str, Any]]:
+    """
+    The same three tools, in the shape the realtime model expects.
+
+    Chat completions nests the definition under "function"; the realtime API
+    flattens it onto the tool itself. Same tools, same descriptions — deriving
+    one from the other rather than writing them twice is what keeps voice and
+    text from quietly drifting apart.
+    """
+    return [
+        {"type": "function", **schema["function"]} for schema in TOOL_SCHEMAS
+    ]
 
 
 # --- Execution --------------------------------------------------------------

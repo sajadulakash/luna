@@ -5,17 +5,16 @@ import { useVoiceStore, type VoiceState } from '../../stores/voiceStore';
 /**
  * The voice surface: a large orb over a blurred console.
  *
- * The small orb beside the composer is a switch. This is where a spoken turn
- * actually happens — the console is pushed out of focus so the only thing on
- * screen is Luna listening, which is the honest representation of what the
- * machine is doing.
+ * The orb is held to talk. The microphone is muted between holds, so a room
+ * with other people in it reaches nothing — which is the point: a voice
+ * detector cannot tell your voice from theirs, and a button can.
  *
- * The orb is the state machine made visible. It reads amplitude from the
- * store: the microphone's while listening, the playback's while speaking.
+ * The orb reads amplitude from the store: the microphone's while listening,
+ * Luna's while speaking.
  */
 
 interface VoiceOverlayProps {
-  /** Leaves voice entirely. */
+  /** Hangs up and leaves voice. */
   onClose: () => void;
   onHoldStart: () => void;
   onHoldEnd: () => void;
@@ -23,10 +22,11 @@ interface VoiceOverlayProps {
 
 const STATUS: Record<VoiceState, string> = {
   idle: '',
-  armed: 'Ready',
-  capturing: 'Listening',
+  connecting: 'Connecting…',
+  listening: 'Hold the circle to talk',
+  capturing: 'Listening — keep holding',
   thinking: 'Thinking',
-  speaking: 'Luna is speaking',
+  speaking: 'Luna is speaking — hold to interrupt',
 };
 
 function useReducedMotion(): boolean {
@@ -43,15 +43,11 @@ function useReducedMotion(): boolean {
   return reduced;
 }
 
-export function VoiceOverlay({
-  onClose,
-  onHoldStart,
-  onHoldEnd,
-}: VoiceOverlayProps) {
+export function VoiceOverlay({ onClose, onHoldStart, onHoldEnd }: VoiceOverlayProps) {
   const state = useVoiceStore((s) => s.state);
   const amplitude = useVoiceStore((s) => s.amplitude);
-  const interim = useVoiceStore((s) => s.interim);
-  const captured = useVoiceStore((s) => s.captured);
+  const lunaTranscript = useVoiceStore((s) => s.lunaTranscript);
+  const userTranscript = useVoiceStore((s) => s.userTranscript);
   const error = useVoiceStore((s) => s.error);
   const reducedMotion = useReducedMotion();
 
@@ -85,7 +81,6 @@ export function VoiceOverlay({
   })();
 
   const ringColor = state === 'speaking' ? 'border-free' : 'border-accent';
-  const transcript = [captured, interim].filter(Boolean).join(' ');
 
   return (
     <div
@@ -99,7 +94,7 @@ export function VoiceOverlay({
           ref={closeRef}
           type="button"
           onClick={onClose}
-          aria-label="Stop talking to Luna"
+          aria-label="End the call with Luna"
           className="tap flex items-center justify-center px-16 text-muted transition-colors duration-150 ease-out hover:text-ink"
         >
           <X size={22} aria-hidden="true" />
@@ -108,8 +103,8 @@ export function VoiceOverlay({
 
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-32 px-24">
         <div className="relative flex h-orb w-orb items-center justify-center">
-          {/* Rings travel outward while she is listening or speaking. Under
-              reduced motion they are not rendered at all. */}
+          {/* Rings travel outward while someone is making sound. Under reduced
+              motion they are not rendered at all. */}
           {live && !reducedMotion
             ? [0, 1].map((index) => (
                 <span
@@ -141,7 +136,7 @@ export function VoiceOverlay({
               'relative flex h-orb w-orb touch-none select-none items-center justify-center rounded-pill',
               'transition-colors duration-250 ease-out',
               fill,
-              state === 'armed' && !reducedMotion
+              (state === 'listening' || state === 'connecting') && !reducedMotion
                 ? 'motion-safe:animate-luna-breathe'
                 : '',
             ].join(' ')}
@@ -161,16 +156,24 @@ export function VoiceOverlay({
           ) : null}
         </div>
 
-        <div className="flex min-h-64 flex-col items-center gap-8" aria-live="polite">
+        <div
+          className="flex min-h-64 max-w-chat flex-col items-center gap-8"
+          aria-live="polite"
+        >
           {error ? (
-            <p role="alert" className="max-w-chat text-center text-15 text-busy">
+            <p role="alert" className="text-center text-15 text-busy">
               {error}
             </p>
           ) : (
             <>
               <p className="text-13 text-faint">{STATUS[state]}</p>
-              {transcript ? (
-                <p className="max-w-chat text-center text-20 text-ink">{transcript}</p>
+
+              {/* What she is saying, as she says it. Falls back to the last
+                  thing heard so the screen isn't blank between turns. */}
+              {lunaTranscript ? (
+                <p className="text-center text-20 text-ink">{lunaTranscript}</p>
+              ) : userTranscript ? (
+                <p className="text-center text-17 text-muted">“{userTranscript}”</p>
               ) : null}
             </>
           )}

@@ -3,29 +3,34 @@ import { create } from 'zustand';
 /**
  * The voice state machine.
  *
- * Every piece of voice UI reads from this store and nothing keeps its own
- * copy. The store holds no browser objects — no MediaRecorder, no Audio, no
- * AnalyserNode — so the whole machine is unit-testable with no microphone
- * involved. The hooks own those objects and drive the machine from outside.
+ * Voice is one speech-to-speech model on the other end of a WebRTC
+ * connection, so most of what this machine used to do is now done for us: the
+ * model decides when a turn has ended, and interrupting it is just talking.
+ * What is left is describing, for the UI, which of five things is happening.
+ *
+ * The store holds no browser objects — no RTCPeerConnection, no MediaStream,
+ * no Audio — so the whole machine is unit-testable with no microphone
+ * involved. The session hook owns those and drives the machine from outside.
  */
 
 export type VoiceState =
-  | 'idle'        // mic off. hold-to-talk mode, or voice disabled.
-  | 'armed'       // mic is ready for held speech.
-  | 'capturing'   // accumulating the current held request.
-  | 'thinking'    // sent, waiting on the stream.
-  | 'speaking';   // playing Luna's audio.
+  | 'idle'         // no session
+  | 'connecting'   // negotiating the connection, asking for the mic
+  | 'listening'    // session live, nobody talking
+  | 'capturing'    // the user is speaking
+  | 'thinking'     // their turn ended, Luna is working on a reply
+  | 'speaking';    // Luna is talking
 
 export type VoiceEvent =
-  | 'ARM'
-  | 'DISARM'
-  | 'WAKE_WORD'
-  | 'SILENCE_2S'
+  | 'CONNECT'
+  | 'READY'
+  | 'SPEECH_STARTED'
+  | 'SPEECH_STOPPED'
+  | 'RESPONSE_STARTED'
   | 'FIRST_AUDIO'
-  | 'ERROR'
   | 'AUDIO_END'
-  | 'BARGE_IN'
-  | 'RELEASE';
+  | 'ERROR'
+  | 'DISCONNECT';
 
 export type MicPermission = 'unknown' | 'granted' | 'denied';
 
@@ -33,15 +38,42 @@ export type MicPermission = 'unknown' | 'granted' | 'denied';
  * Voice-state transitions.
  *
  * An event that is not listed for the current state is ignored rather than
- * throwing — recognition fires callbacks in orders the machine doesn't expect
- * (a stray result arriving after DISARM, say), and dropping those is correct.
+ * throwing. The realtime connection delivers events in orders the UI doesn't
+ * expect — audio finishing after the user has already started talking over
+ * it, say — and dropping those is correct.
+ *
+ * SPEECH_STARTED is legal from thinking and speaking as well as listening,
+ * and that single fact is barge-in: interrupting Luna is not a special
+ * gesture, it is just speaking while she happens to be talking.
  */
 const TRANSITIONS: Record<VoiceState, Partial<Record<VoiceEvent, VoiceState>>> = {
-  idle: { ARM: 'armed' },
-  armed: { WAKE_WORD: 'capturing', DISARM: 'idle' },
-  capturing: { SILENCE_2S: 'thinking', RELEASE: 'armed', DISARM: 'idle' },
-  thinking: { FIRST_AUDIO: 'speaking', ERROR: 'armed' },
-  speaking: { AUDIO_END: 'armed', BARGE_IN: 'capturing' },
+  idle: { CONNECT: 'connecting' },
+  connecting: { READY: 'listening', ERROR: 'idle', DISCONNECT: 'idle' },
+  listening: {
+    SPEECH_STARTED: 'capturing',
+    RESPONSE_STARTED: 'thinking',
+    ERROR: 'idle',
+    DISCONNECT: 'idle',
+  },
+  capturing: {
+    SPEECH_STOPPED: 'thinking',
+    RESPONSE_STARTED: 'thinking',
+    ERROR: 'listening',
+    DISCONNECT: 'idle',
+  },
+  thinking: {
+    FIRST_AUDIO: 'speaking',
+    SPEECH_STARTED: 'capturing',
+    AUDIO_END: 'listening',
+    ERROR: 'listening',
+    DISCONNECT: 'idle',
+  },
+  speaking: {
+    AUDIO_END: 'listening',
+    SPEECH_STARTED: 'capturing',
+    ERROR: 'listening',
+    DISCONNECT: 'idle',
+  },
 };
 
 /** Pure transition. Returns null when the event is not legal in that state. */
@@ -53,22 +85,24 @@ export function canTransition(state: VoiceState, event: VoiceEvent): boolean {
   return transition(state, event) !== null;
 }
 
+/** The states in which the connection is up and Luna is in the conversation. */
+export function isLive(state: VoiceState): boolean {
+  return state !== 'idle' && state !== 'connecting';
+}
+
 interface VoiceStoreState {
   state: VoiceState;
 
-  /** False on Safari and Firefox — chat still works, voice is hidden. */
+  /** False without WebRTC, a microphone, or a secure context. */
   supported: boolean;
   permission: MicPermission;
 
-  /** True while the spacebar (or the orb) is held in hold-to-talk mode. */
-  holding: boolean;
+  /** Luna's reply as she says it, streamed a phrase at a time. */
+  lunaTranscript: string;
+  /** The caller's last finished utterance, as the model heard it. */
+  userTranscript: string;
 
-  /** Live, uncommitted transcript — shown greyed in the composer. */
-  interim: string;
-  /** The speech captured during the current press. */
-  captured: string;
-
-  /** 0–1, from an AnalyserNode. Drives the orb's scale. */
+  /** 0–1. The microphone's level while listening, Luna's while speaking. */
   amplitude: number;
 
   error: string | null;
@@ -76,16 +110,14 @@ interface VoiceStoreState {
   dispatch: (event: VoiceEvent) => boolean;
   setSupported: (supported: boolean) => void;
   setPermission: (permission: MicPermission) => void;
-  setHolding: (holding: boolean) => void;
-  setInterim: (text: string) => void;
-  appendCaptured: (text: string) => void;
-  clearCaptured: () => void;
+  setLunaTranscript: (text: string) => void;
+  appendLunaTranscript: (text: string) => void;
+  setUserTranscript: (text: string) => void;
   setAmplitude: (amplitude: number) => void;
   setError: (message: string | null) => void;
   /**
-   * Hard stop outside the normal table: drops straight to idle from any state.
-   * Backs the "turn voice off" control, which has to work even mid-reply.
-   * Ordinary flow uses dispatch('DISARM').
+   * Hard stop outside the normal table: drops straight to idle from any
+   * state. Backs "hang up", which has to work mid-sentence.
    */
   reset: () => void;
 }
@@ -94,9 +126,8 @@ const INITIAL = {
   state: 'idle' as VoiceState,
   supported: false,
   permission: 'unknown' as MicPermission,
-  holding: false,
-  interim: '',
-  captured: '',
+  lunaTranscript: '',
+  userTranscript: '',
   amplitude: 0,
   error: null as string | null,
 };
@@ -110,11 +141,15 @@ export const useVoiceStore = create<VoiceStoreState>((set, get) => ({
 
     set((prev) => ({
       state: next,
-      // Leaving capturing for any reason clears the live transcript: it has
-      // either been committed to a message or abandoned.
-      interim: next === 'capturing' || prev.state !== 'capturing' ? prev.interim : '',
-      // Amplitude is meaningless in states that don't listen or speak.
-      amplitude: next === 'capturing' || next === 'speaking' ? prev.amplitude : 0,
+      // A new user turn clears the last exchange from the overlay: what is on
+      // screen should be this turn, not the previous one lingering behind it.
+      lunaTranscript:
+        event === 'SPEECH_STARTED' ? '' : prev.lunaTranscript,
+      // Amplitude is meaningless in states that neither listen nor speak.
+      amplitude:
+        next === 'capturing' || next === 'speaking' || next === 'listening'
+          ? prev.amplitude
+          : 0,
       error: event === 'ERROR' ? prev.error : null,
     }));
 
@@ -123,21 +158,16 @@ export const useVoiceStore = create<VoiceStoreState>((set, get) => ({
 
   setSupported: (supported) => set({ supported }),
   setPermission: (permission) => set({ permission }),
-  setHolding: (holding) => set({ holding }),
-  setInterim: (interim) => set({ interim }),
-
-  appendCaptured: (text) =>
-    set((prev) => ({
-      captured: prev.captured ? `${prev.captured} ${text}`.trim() : text.trim(),
-    })),
-
-  clearCaptured: () => set({ captured: '', interim: '' }),
+  setLunaTranscript: (lunaTranscript) => set({ lunaTranscript }),
+  appendLunaTranscript: (text) =>
+    set((prev) => ({ lunaTranscript: prev.lunaTranscript + text })),
+  setUserTranscript: (userTranscript) => set({ userTranscript }),
   setAmplitude: (amplitude) =>
     set((prev) => (prev.amplitude === amplitude ? prev : { amplitude })),
   setError: (error) => set({ error }),
 
   reset: () =>
-    set({ state: 'idle', interim: '', captured: '', amplitude: 0 }),
+    set({ state: 'idle', lunaTranscript: '', userTranscript: '', amplitude: 0 }),
 }));
 
 /** Exposed for tests: returns the store to its initial values. */

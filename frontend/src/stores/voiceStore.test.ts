@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   canTransition,
+  isLive,
   resetVoiceStore,
   transition,
   useVoiceStore,
@@ -9,36 +10,60 @@ import {
 } from './voiceStore';
 
 /**
- * Every transition in §9, with no microphone involved. The machine is a pure
- * function precisely so this file never needs to touch a browser API.
+ * Every transition in the voice machine, with no microphone and no network.
+ * The machine is a pure function precisely so this file never needs to touch a
+ * browser API.
  */
 
-const ALL_STATES: VoiceState[] = ['idle', 'armed', 'capturing', 'thinking', 'speaking'];
-
-const ALL_EVENTS: VoiceEvent[] = [
-  'ARM',
-  'DISARM',
-  'WAKE_WORD',
-  'SILENCE_2S',
-  'FIRST_AUDIO',
-  'ERROR',
-  'AUDIO_END',
-  'BARGE_IN',
-  'RELEASE',
+const ALL_STATES: VoiceState[] = [
+  'idle',
+  'connecting',
+  'listening',
+  'capturing',
+  'thinking',
+  'speaking',
 ];
 
-/** The table from the brief, transcribed independently of the implementation. */
+const ALL_EVENTS: VoiceEvent[] = [
+  'CONNECT',
+  'READY',
+  'SPEECH_STARTED',
+  'SPEECH_STOPPED',
+  'RESPONSE_STARTED',
+  'FIRST_AUDIO',
+  'AUDIO_END',
+  'ERROR',
+  'DISCONNECT',
+];
+
+/** The intended table, written out independently of the implementation. */
 const SPEC: Array<[VoiceState, VoiceEvent, VoiceState]> = [
-  ['idle', 'ARM', 'armed'],
-  ['armed', 'WAKE_WORD', 'capturing'],
-  ['armed', 'DISARM', 'idle'],
-  ['capturing', 'SILENCE_2S', 'thinking'],
-  ['capturing', 'RELEASE', 'armed'],
-  ['capturing', 'DISARM', 'idle'],
+  ['idle', 'CONNECT', 'connecting'],
+
+  ['connecting', 'READY', 'listening'],
+  ['connecting', 'ERROR', 'idle'],
+  ['connecting', 'DISCONNECT', 'idle'],
+
+  ['listening', 'SPEECH_STARTED', 'capturing'],
+  ['listening', 'RESPONSE_STARTED', 'thinking'],
+  ['listening', 'ERROR', 'idle'],
+  ['listening', 'DISCONNECT', 'idle'],
+
+  ['capturing', 'SPEECH_STOPPED', 'thinking'],
+  ['capturing', 'RESPONSE_STARTED', 'thinking'],
+  ['capturing', 'ERROR', 'listening'],
+  ['capturing', 'DISCONNECT', 'idle'],
+
   ['thinking', 'FIRST_AUDIO', 'speaking'],
-  ['thinking', 'ERROR', 'armed'],
-  ['speaking', 'AUDIO_END', 'armed'],
-  ['speaking', 'BARGE_IN', 'capturing'],
+  ['thinking', 'SPEECH_STARTED', 'capturing'],
+  ['thinking', 'AUDIO_END', 'listening'],
+  ['thinking', 'ERROR', 'listening'],
+  ['thinking', 'DISCONNECT', 'idle'],
+
+  ['speaking', 'AUDIO_END', 'listening'],
+  ['speaking', 'SPEECH_STARTED', 'capturing'],
+  ['speaking', 'ERROR', 'listening'],
+  ['speaking', 'DISCONNECT', 'idle'],
 ];
 
 describe('transition', () => {
@@ -46,23 +71,30 @@ describe('transition', () => {
     expect(transition(from, event)).toBe(to);
   });
 
-  it('has exactly the transitions the brief specifies', () => {
+  it('has exactly the transitions specified and no others', () => {
     const legal = ALL_STATES.flatMap((state) =>
       ALL_EVENTS.filter((event) => canTransition(state, event)).map(
         (event) => `${state}:${event}`,
       ),
     );
 
-    expect(legal.sort()).toEqual(
-      SPEC.map(([from, event]) => `${from}:${event}`).sort(),
-    );
+    expect(legal.sort()).toEqual(SPEC.map(([f, e]) => `${f}:${e}`).sort());
   });
 
   it('returns null for an event that is not legal in the current state', () => {
-    expect(transition('idle', 'BARGE_IN')).toBeNull();
-    expect(transition('armed', 'AUDIO_END')).toBeNull();
-    expect(transition('speaking', 'ARM')).toBeNull();
-    expect(transition('thinking', 'WAKE_WORD')).toBeNull();
+    expect(transition('idle', 'AUDIO_END')).toBeNull();
+    expect(transition('idle', 'SPEECH_STARTED')).toBeNull();
+    expect(transition('connecting', 'SPEECH_STARTED')).toBeNull();
+    expect(transition('listening', 'FIRST_AUDIO')).toBeNull();
+  });
+
+  it('treats a call as live only once it is connected', () => {
+    expect(ALL_STATES.filter(isLive)).toEqual([
+      'listening',
+      'capturing',
+      'thinking',
+      'speaking',
+    ]);
   });
 });
 
@@ -71,109 +103,128 @@ describe('the store', () => {
     resetVoiceStore();
   });
 
+  const store = () => useVoiceStore.getState();
+
   it('starts idle', () => {
-    expect(useVoiceStore.getState().state).toBe('idle');
+    expect(store().state).toBe('idle');
   });
 
   it('reports whether a dispatch was applied', () => {
-    const { dispatch } = useVoiceStore.getState();
+    expect(store().dispatch('CONNECT')).toBe(true);
+    expect(store().state).toBe('connecting');
 
-    expect(dispatch('ARM')).toBe(true);
-    expect(useVoiceStore.getState().state).toBe('armed');
-
-    expect(useVoiceStore.getState().dispatch('AUDIO_END')).toBe(false);
-    expect(useVoiceStore.getState().state).toBe('armed');
+    expect(store().dispatch('AUDIO_END')).toBe(false);
+    expect(store().state).toBe('connecting');
   });
 
-  it('walks a full turn: idle → armed → capturing → thinking → speaking → armed', () => {
+  it('walks a full turn: idle → connecting → listening → capturing → thinking → speaking → listening', () => {
     const steps: VoiceEvent[] = [
-      'ARM',
-      'WAKE_WORD',
-      'SILENCE_2S',
+      'CONNECT',
+      'READY',
+      'SPEECH_STARTED',
+      'SPEECH_STOPPED',
       'FIRST_AUDIO',
       'AUDIO_END',
     ];
 
     const seen: VoiceState[] = [];
     for (const event of steps) {
-      useVoiceStore.getState().dispatch(event);
-      seen.push(useVoiceStore.getState().state);
+      store().dispatch(event);
+      seen.push(store().state);
     }
 
-    expect(seen).toEqual(['armed', 'capturing', 'thinking', 'speaking', 'armed']);
+    expect(seen).toEqual([
+      'connecting',
+      'listening',
+      'capturing',
+      'thinking',
+      'speaking',
+      'listening',
+    ]);
   });
 
-  it('returns to armed when a press is released without speech', () => {
-    const store = () => useVoiceStore.getState();
-    store().dispatch('ARM');
-    store().dispatch('WAKE_WORD');
-
-    // Never through idle: that would tear down and re-acquire the microphone.
-    expect(store().dispatch('RELEASE')).toBe(true);
-    expect(store().state).toBe('armed');
-  });
-
-  it('returns to capturing on barge-in', () => {
-    const store = () => useVoiceStore.getState();
-    store().dispatch('ARM');
-    store().dispatch('WAKE_WORD');
-    store().dispatch('SILENCE_2S');
+  it('lets the user interrupt Luna mid-sentence just by speaking', () => {
+    store().dispatch('CONNECT');
+    store().dispatch('READY');
+    store().dispatch('SPEECH_STARTED');
+    store().dispatch('SPEECH_STOPPED');
     store().dispatch('FIRST_AUDIO');
-
     expect(store().state).toBe('speaking');
-    expect(store().dispatch('BARGE_IN')).toBe(true);
+
+    // Barge-in is not its own gesture — it is SPEECH_STARTED arriving while
+    // she happens to be talking. Never via idle: that would drop the call.
+    expect(store().dispatch('SPEECH_STARTED')).toBe(true);
     expect(store().state).toBe('capturing');
   });
 
-  it('goes back to armed when the turn errors', () => {
-    const store = () => useVoiceStore.getState();
-    store().dispatch('ARM');
-    store().dispatch('WAKE_WORD');
-    store().dispatch('SILENCE_2S');
+  it('interrupts her before she has made a sound, too', () => {
+    store().dispatch('CONNECT');
+    store().dispatch('READY');
+    store().dispatch('SPEECH_STARTED');
+    store().dispatch('SPEECH_STOPPED');
+    expect(store().state).toBe('thinking');
 
-    store().dispatch('ERROR');
-    expect(store().state).toBe('armed');
+    expect(store().dispatch('SPEECH_STARTED')).toBe(true);
+    expect(store().state).toBe('capturing');
   });
 
-  it('clears the interim transcript when it leaves capturing', () => {
-    const store = () => useVoiceStore.getState();
-    store().dispatch('ARM');
-    store().dispatch('WAKE_WORD');
-    store().setInterim('what does Tuesday look like');
+  it('keeps the call open when a single turn errors', () => {
+    store().dispatch('CONNECT');
+    store().dispatch('READY');
+    store().dispatch('SPEECH_STARTED');
+    store().dispatch('SPEECH_STOPPED');
 
-    store().dispatch('SILENCE_2S');
-    expect(store().interim).toBe('');
+    store().dispatch('ERROR');
+    expect(store().state).toBe('listening');
+  });
+
+  it('drops the call when connecting itself fails', () => {
+    store().dispatch('CONNECT');
+    store().dispatch('ERROR');
+    expect(store().state).toBe('idle');
+  });
+
+  it("clears the last reply when a new turn starts", () => {
+    store().dispatch('CONNECT');
+    store().dispatch('READY');
+    store().appendLunaTranscript('You have two meetings tomorrow.');
+
+    store().dispatch('SPEECH_STARTED');
+    expect(store().lunaTranscript).toBe('');
+  });
+
+  it('accumulates the reply as it is spoken', () => {
+    store().appendLunaTranscript('You have ');
+    store().appendLunaTranscript('two meetings.');
+    expect(store().lunaTranscript).toBe('You have two meetings.');
   });
 
   it('zeroes the amplitude in states that neither listen nor speak', () => {
-    const store = () => useVoiceStore.getState();
-    store().dispatch('ARM');
-    store().dispatch('WAKE_WORD');
+    store().dispatch('CONNECT');
+    store().dispatch('READY');
+    store().dispatch('SPEECH_STARTED');
     store().setAmplitude(0.8);
 
-    store().dispatch('SILENCE_2S');
+    store().dispatch('SPEECH_STOPPED');
     expect(store().amplitude).toBe(0);
   });
 
-  it('accumulates captured speech across final results', () => {
-    const store = () => useVoiceStore.getState();
-    store().appendCaptured('what does');
-    store().appendCaptured('Tuesday look like');
-
-    expect(store().captured).toBe('what does Tuesday look like');
-  });
-
-  it('reset drops to idle from any state, including mid-reply', () => {
+  it('reset drops to idle from any state, including mid-sentence', () => {
     for (const state of ALL_STATES) {
       resetVoiceStore();
-      useVoiceStore.setState({ state, interim: 'x', captured: 'y', amplitude: 0.5 });
+      useVoiceStore.setState({
+        state,
+        lunaTranscript: 'x',
+        userTranscript: 'y',
+        amplitude: 0.5,
+      });
 
-      useVoiceStore.getState().reset();
+      store().reset();
 
-      expect(useVoiceStore.getState().state).toBe('idle');
-      expect(useVoiceStore.getState().interim).toBe('');
-      expect(useVoiceStore.getState().captured).toBe('');
-      expect(useVoiceStore.getState().amplitude).toBe(0);
+      expect(store().state).toBe('idle');
+      expect(store().lunaTranscript).toBe('');
+      expect(store().userTranscript).toBe('');
+      expect(store().amplitude).toBe(0);
     }
   });
 });

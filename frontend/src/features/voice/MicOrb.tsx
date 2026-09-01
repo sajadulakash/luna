@@ -2,26 +2,26 @@ import { useEffect, useState } from 'react';
 import { useVoiceStore, type VoiceState } from '../../stores/voiceStore';
 
 /**
- * The orb beside the composer: one circle, five states, no text labels.
+ * The orb beside the composer: one circle, six states, no text labels.
  *
- * This is the way in to voice, and a live indicator of it — when the mic is
- * armed but no turn is running, this is all that is on screen, so the owner
- * can see at a glance that Luna is listening without anything covering the
- * console. Tapping it opens the voice surface, where a turn actually happens.
+ * This is the way in to voice, and a live indicator of it — while a call is
+ * up but the overlay is closed, this is all that is on screen, so the owner
+ * can see at a glance that Luna is still listening.
  *
  * Under prefers-reduced-motion every pulse is replaced with a static colour
  * change — the state stays readable without anything moving.
  */
 
 interface MicOrbProps {
-  /** Opens the voice surface, arming the mic first if it is off. */
+  /** Opens the voice surface, starting a call if there isn't one. */
   onToggle: () => void;
   disabled?: boolean;
 }
 
 const LABELS: Record<VoiceState, string> = {
   idle: 'Talk to Luna',
-  armed: 'Ready. Hold the orb to talk.',
+  connecting: 'Connecting to Luna',
+  listening: 'Luna is listening',
   capturing: 'Listening',
   thinking: 'Luna is thinking',
   speaking: 'Luna is speaking',
@@ -57,7 +57,11 @@ export function MicOrb({ onToggle, disabled = false }: MicOrbProps) {
     switch (state) {
       case 'idle':
         return 'bg-transparent border-2 border-faint';
-      case 'armed':
+      case 'connecting':
+        return `bg-transparent border-2 border-faint ${
+          reducedMotion ? '' : 'motion-safe:animate-luna-breathe'
+        }`;
+      case 'listening':
         return `bg-transparent border-2 border-accent ${
           reducedMotion ? '' : 'motion-safe:animate-luna-breathe'
         }`;

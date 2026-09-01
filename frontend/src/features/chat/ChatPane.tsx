@@ -19,8 +19,10 @@ import { Composer } from './Composer';
  */
 
 export interface ChatPaneHandle {
-  /** Sends a message from outside — the voice controller uses this. */
+  /** Sends a message from outside, as if it had been typed. */
   send: (text: string) => void;
+  /** Shows a turn that has already happened — voice mode's transcript. */
+  appendMessage: (role: 'user' | 'assistant', content: string) => void;
 }
 
 export interface ChatPaneProps {
@@ -63,7 +65,11 @@ export const ChatPane = forwardRef<ChatPaneHandle, ChatPaneProps>(function ChatP
 ) {
   const session = useChatSession({ token, greeting, onAssistantMessage });
 
-  useImperativeHandle(ref, () => ({ send: session.send }), [session.send]);
+  useImperativeHandle(
+    ref,
+    () => ({ send: session.send, appendMessage: session.appendMessage }),
+    [session.appendMessage, session.send],
+  );
 
   useStreamingReporter(session.streaming, onStreamingChange);
 

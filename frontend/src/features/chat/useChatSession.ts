@@ -231,6 +231,29 @@ export function useChatSession({
     [nextLocalId, runStream, streaming],
   );
 
+  /**
+   * Puts a finished turn into the conversation without sending anything.
+   *
+   * Voice mode talks to the model directly, so its turns are already said and
+   * already saved by the time they get here — they only need to appear.
+   */
+  const appendMessage = useCallback(
+    (role: 'user' | 'assistant', content: string) => {
+      const text = content.trim();
+      if (!text) return;
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: nextLocalId(),
+          role,
+          content: text,
+          created_at: new Date().toISOString(),
+        },
+      ]);
+    },
+    [nextLocalId],
+  );
+
   const retry = useCallback(() => {
     const last = lastSentRef.current;
     if (!last || streaming) return;
@@ -255,6 +278,7 @@ export function useChatSession({
     error,
     historyState,
     send,
+    appendMessage,
     retry,
     dismissError: useCallback(() => setError(null), []),
   };

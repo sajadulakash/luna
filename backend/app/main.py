@@ -4,18 +4,17 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import json
+import random
 from typing import Any
 
 from fastapi import (
     Cookie,
     Depends,
     FastAPI,
-    File,
     Header,
     HTTPException,
     Query,
     Response,
-    UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -30,19 +29,44 @@ from .schemas import (
     CreateMeetingRequest,
     LoginRequest,
     PolicyUpdate,
+    RealtimeSessionRequest,
+    RealtimeToolRequest,
+    RealtimeTranscriptRequest,
     RescheduleMeetingRequest,
-    TTSRequest,
 )
 from .scheduling import POLICIES, fake_slots, iso, parse_iso
 from .security import access_token_for, verify_password
-from .services.openrouter import OpenRouterClient, OpenRouterError
-from .tools import TOOL_SCHEMAS, WRITE_TOOLS, execute_tool, zone
+from .services.openai_client import OpenAIClient, OpenAIError
+from .tools import (
+    TOOL_NAMES,
+    TOOL_SCHEMAS,
+    WRITE_TOOLS,
+    execute_tool,
+    realtime_tool_schemas,
+    zone,
+)
 
 
 # How many times the model may call tools and be given the results before we
 # stop and make it answer. A booking needs three at most (look up the person,
 # check the time, book it); anything beyond this is a loop.
 MAX_TOOL_ROUNDS = 5
+
+# Enough to name the configured language in the prompt. An unlisted code falls
+# through as itself, which still reads sensibly: "Always reply in pt-BR".
+LANGUAGE_NAMES = {
+    "en": "English",
+    "bn": "Bengali",
+    "hi": "Hindi",
+    "ur": "Urdu",
+    "ar": "Arabic",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "pt": "Portuguese",
+    "ja": "Japanese",
+    "zh": "Chinese",
+}
 
 
 def build_system_prompt(
@@ -64,15 +88,34 @@ def build_system_prompt(
     now = datetime.now(timezone.utc).astimezone(zone(tz_name))
     stamp = now.strftime("%A, %d %B %Y at %I:%M %p").replace(" 0", " ")
     who = "the boss" if role == "BOSS" else "an employee"
+    # The boss is addressed by his title, not his name: "yes boss", never
+    # "yes Rafi". Everyone else gets their first name.
+    address = (
+        f'Address them as "boss" — "yes boss", never "yes {name}". Their name '
+        f"is still {name} and you should say so if they ask; it is only the "
+        "form of address that is by title."
+        if role == "BOSS"
+        else f"Address them by their first name, {name.split(' ')[0]}."
+    )
     team = "\n".join(
         f"  - {member} ({'boss' if member_role == 'BOSS' else 'employee'})"
         for member, member_role in roster
     )
+    language = LANGUAGE_NAMES.get(
+        settings.openai_voice_language.lower(), settings.openai_voice_language
+    )
 
     return f"""You are Luna, a warm and concise scheduling assistant.
 
-You are speaking with {name}, who is {who}. It is currently {stamp} in
-{tz_name}. Resolve "today", "tomorrow" and "4 pm" against that.
+You are speaking with {name}, who is {who}. {address}
+
+Always reply in {language}, and only in {language}. If they say something in
+another language, or you are unsure what you heard, still answer in
+{language} — never switch, and never mix two languages in one reply. When you
+genuinely cannot make out what was said, ask them to repeat it, in {language}.
+
+It is currently {stamp} in {tz_name}. Resolve "today", "tomorrow" and "4 pm"
+against that.
 
 The team is:
 {team}
@@ -116,13 +159,13 @@ LAN_ORIGIN = (
 REFRESH_COOKIE = "luna_refresh"
 
 settings = get_settings()
-openrouter = OpenRouterClient(settings)
+openai_client = OpenAIClient(settings)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     yield
-    await openrouter.close()
+    await openai_client.close()
 
 
 app = FastAPI(
@@ -272,9 +315,10 @@ def health(db: Session = Depends(get_db)) -> dict[str, Any]:
     return {
         "status": "ok",
         "database_connected": True,
-        "openrouter_configured": openrouter.configured,
-        "chat_model": settings.openrouter_chat_model,
-        "tts_model": settings.openrouter_tts_model,
+        "openai_configured": openai_client.configured,
+        "chat_model": settings.openai_chat_model,
+        "realtime_model": settings.openai_realtime_model,
+        "voice": settings.openai_voice,
     }
 
 
@@ -404,7 +448,7 @@ async def chat(
                 spoken: list[str] = []
                 tool_calls: list[dict[str, Any]] = []
 
-                async for event in openrouter.stream_chat(convo, tools=TOOL_SCHEMAS):
+                async for event in openai_client.stream_chat(convo, tools=TOOL_SCHEMAS):
                     if event["type"] == "token":
                         spoken.append(event["text"])
                         yield sse("token", {"text": event["text"]})
@@ -486,10 +530,10 @@ async def chat(
                     )
         except asyncio.CancelledError:
             raise
-        except OpenRouterError as exc:
+        except OpenAIError as exc:
             yield sse(
                 "error",
-                {"error": "openrouter_error", "message": str(exc)},
+                {"error": "openai_error", "message": str(exc)},
             )
             return
         except Exception:
@@ -539,66 +583,278 @@ async def chat(
     )
 
 
-@app.post("/api/voice/tts")
-async def tts(body: TTSRequest) -> StreamingResponse:
-    try:
-        response = await openrouter.open_tts_stream(body.text.strip())
-    except OpenRouterError as exc:
-        status = exc.status_code if 400 <= exc.status_code < 600 else 502
-        raise HTTPException(status_code=status, detail=str(exc)) from exc
+# Voice mode is one speech-to-speech model, not a transcribe-think-speak
+# relay. The browser holds a WebRTC connection straight to OpenAI, so audio
+# never touches this server; what does come through here is everything that
+# needs authority — who the caller is, what the model is allowed to do, and
+# what gets written down.
 
-    async def audio_bytes():
-        try:
-            async for chunk in response.aiter_bytes():
-                if chunk:
-                    yield chunk
-        finally:
-            await response.aclose()
 
-    return StreamingResponse(
-        audio_bytes(),
-        media_type=response.headers.get("content-type", "audio/mpeg"),
-        headers={"Cache-Control": "no-store"},
+def build_voice_instructions(
+    name: str, role: str, tz_name: str, roster: list[tuple[str, str]]
+) -> str:
+    """
+    The system prompt, plus what only matters when Luna is being heard.
+
+    The same builder as the text path so the two cannot drift: she is one
+    assistant with one set of rules, whether she is read or listened to.
+    """
+    return build_system_prompt(name, role, tz_name, roster) + """
+
+This is a live spoken conversation. They can hear you, and they can interrupt
+you — if they start talking, stop and listen.
+
+Speak only the language named above, in every reply, no matter what you think
+you heard. A noisy room can make a sentence sound like another language; it
+almost never is. If a stretch of audio is unclear, treat it as unclear speech
+in that language and ask them to say it again — never answer in another
+language, and never try to guess at or translate what you heard.
+
+Speak the way people speak. Say "half past four", not "16:30". Never read out
+an ID, a date in numbers, or anything else that only looks right written down.
+Keep turns to a sentence or two: they are waiting on you in real time, and a
+paragraph out loud is far longer than it looks on a page."""
+
+
+# What Luna opens with when a voice call starts.
+#
+# Chosen here rather than asked for in the prompt. Every call is a brand-new
+# session with no memory of the last one, so "vary your greeting" is an
+# instruction the model has no way to follow — asked four times in a row it
+# returns the same sentence four times. Picking the line server-side is what
+# actually makes it vary, and it gets the time of day right from a real clock
+# instead of hoping the model reads the timestamp.
+GREETINGS: dict[str, tuple[str, ...]] = {
+    "morning": (
+        "Good morning, {who}. What do you need?",
+        "Morning, {who}. What's first today?",
+        "Good morning, {who}. How can I help?",
+        "Morning, {who}. What are we starting with?",
+    ),
+    "afternoon": (
+        "Good afternoon, {who}. What can I do for you?",
+        "Afternoon, {who}. What do you need?",
+        "Good afternoon, {who}. How can I help?",
+        "Afternoon, {who}. What's next?",
+    ),
+    "evening": (
+        "Good evening, {who}. What can I help with?",
+        "Evening, {who}. What do you need?",
+        "Good evening, {who}. What's on your mind?",
+    ),
+    "night": (
+        "Still working, {who}? What do you need?",
+        "Late one, {who}. How can I help?",
+        "Evening, {who}. What can I do for you?",
+    ),
+}
+
+
+def part_of_day(hour: int) -> str:
+    if 5 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 17:
+        return "afternoon"
+    if 17 <= hour < 22:
+        return "evening"
+    return "night"
+
+
+def build_greeting(name: str, role: str, tz_name: str) -> str:
+    """The one-line opener for this wake, as an instruction for one response."""
+    now = datetime.now(timezone.utc).astimezone(zone(tz_name))
+    # The boss is addressed by title, everyone else by first name — the same
+    # rule the system prompt states, applied to the line we hand over.
+    who = "boss" if role == "BOSS" else name.split(" ")[0]
+    line = random.choice(GREETINGS[part_of_day(now.hour)]).format(who=who)
+
+    return (
+        f'Open the conversation by saying, warmly and in one breath: "{line}" '
+        "Then stop and wait for them. Say nothing else, and do not call any "
+        "tools — you have not been asked for anything yet."
     )
 
 
-# A held utterance, not a recording session. Anything larger than this is not
-# someone asking for a meeting.
-MAX_AUDIO_BYTES = 25 * 1024 * 1024
+def turn_detection_config() -> dict[str, Any] | None:
+    """
+    When Luna decides you have stopped talking.
+
+    Returning None disables automatic turn-taking altogether: nothing is a
+    turn until the browser says so. That is push-to-talk, and it is the only
+    setting that survives other people talking nearby — a voice detector is
+    built to find voices, so no threshold can be set high enough to hear you
+    and not the room, only high enough to hear neither.
+
+    Of the automatic two, server_vad gates on loudness and semantic_vad on
+    whether a thought sounds finished. semantic_vad reads beautifully in a
+    quiet room and falls apart in a noisy one, having nothing that filters on
+    level at all.
+
+    `interrupt_response` is barge-in for the automatic modes; under
+    push-to-talk the button does that job.
+    """
+    if settings.openai_vad in {"push_to_talk", "manual", "none"}:
+        return None
+
+    if settings.openai_vad == "server_vad":
+        return {
+            "type": "server_vad",
+            "threshold": settings.openai_vad_threshold,
+            "prefix_padding_ms": 300,
+            # Long enough that a pause mid-sentence is not taken as the end of
+            # a turn — the one thing semantic_vad was better at, bought back.
+            "silence_duration_ms": 900,
+            "interrupt_response": True,
+        }
+    return {
+        "type": "semantic_vad",
+        "eagerness": settings.openai_vad_eagerness,
+        "interrupt_response": True,
+    }
 
 
-@app.post("/api/voice/stt")
-async def stt(
-    file: UploadFile = File(...),
+def realtime_session_config(
+    name: str, role: str, tz_name: str, roster: list[tuple[str, str]]
+) -> dict[str, Any]:
+    """
+    Everything the voice session is allowed to be, fixed here at mint time.
+
+    No audio format is named: WebRTC negotiates the codec itself. The input
+    transcription is not what Luna hears — she hears the audio directly — it
+    only gives us the caller's words as text for the chat history.
+    """
+    return {
+        "type": "realtime",
+        "model": settings.openai_realtime_model,
+        "instructions": build_voice_instructions(name, role, tz_name, roster),
+        "output_modalities": ["audio"],
+        "audio": {
+            "input": {
+                "transcription": {
+                    "model": settings.openai_stt_model,
+                    # Without this the transcriber guesses, and it guesses
+                    # badly on accented speech and background chatter —
+                    # returning Bengali or Hindi for English that was simply
+                    # noisy. Pinning the language is the fix.
+                    "language": settings.openai_voice_language,
+                },
+                # Runs before both the transcriber and the model, so a noisy
+                # room stops being heard as speech in the first place.
+                "noise_reduction": {"type": settings.openai_noise_reduction},
+                # None when push-to-talk: no automatic turn-taking at all.
+                "turn_detection": turn_detection_config(),
+            },
+            "output": {"voice": settings.openai_voice},
+        },
+        "tools": realtime_tool_schemas(),
+        "tool_choice": "auto",
+    }
+
+
+@app.post("/api/voice/realtime/session")
+async def realtime_session(
+    body: RealtimeSessionRequest,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> Any:
-    """
-    Transcribes one recorded utterance.
+    """Mints an ephemeral key for one voice conversation."""
+    user = require_user(authorization, db)
+    tz_name = (body.timezone or "UTC").strip() or "UTC"
 
-    The browser records audio and posts it here rather than using its own
-    speech recognition: that was Chrome-only, needed a reachable Google
-    speech service, and could not share the microphone on mobile at all.
-    """
-    require_user(authorization, db)
-
-    audio = await file.read()
-    if not audio:
-        return api_error(400, "empty_audio", "That recording was empty.")
-    if len(audio) > MAX_AUDIO_BYTES:
-        return api_error(413, "audio_too_large", "That recording is too long.")
+    roster = [
+        (member.name, member.role)
+        for member in db.scalars(
+            select(User).where(User.team_id == user.team_id).order_by(User.name)
+        )
+    ]
 
     try:
-        text = await openrouter.transcribe(
-            audio,
-            file.filename or "speech.webm",
-            file.content_type or "application/octet-stream",
+        minted = await openai_client.create_realtime_client_secret(
+            realtime_session_config(user.name, user.role, tz_name, roster)
         )
-    except OpenRouterError as exc:
+    except OpenAIError as exc:
         status = exc.status_code if 400 <= exc.status_code < 600 else 502
-        return api_error(status, "transcription_failed", str(exc))
+        return api_error(status, "realtime_unavailable", str(exc))
 
-    return {"text": text}
+    # Only the secret and its expiry. The session body echoes the whole prompt
+    # back, and the browser has no use for it.
+    return {
+        "client_secret": minted.get("value"),
+        "expires_at": minted.get("expires_at"),
+        "model": settings.openai_realtime_model,
+        # Spoken the moment the connection opens, so opening the line is met
+        # by a voice rather than by silence.
+        "greeting": build_greeting(user.name, user.role, tz_name),
+    }
+
+
+@app.post("/api/voice/realtime/tool")
+async def realtime_tool(
+    body: RealtimeToolRequest,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Runs one tool the voice model asked for.
+
+    The browser relays the call but never carries the authority for it: the
+    actor is the authenticated user of *this* request, so a session that asks
+    to read someone else's calendar gets its own, exactly as on the text path.
+    """
+    user = require_user(authorization, db)
+    tz_name = (body.timezone or "UTC").strip() or "UTC"
+
+    if body.name not in TOOL_NAMES:
+        return {
+            "ok": False,
+            "error": f"There is no tool called {body.name}.",
+            "calendar_changed": False,
+        }
+
+    try:
+        arguments = json.loads(body.arguments or "{}")
+    except json.JSONDecodeError:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    # Off the event loop: execute_tool is synchronous SQLAlchemy.
+    result = await asyncio.to_thread(
+        execute_tool, body.name, arguments, user.id, tz_name
+    )
+    succeeded = bool(result.get("ok", True))
+
+    return {
+        "result": result,
+        # Saves the browser having to know which tools write.
+        "calendar_changed": succeeded and body.name in WRITE_TOOLS,
+    }
+
+
+@app.post("/api/voice/realtime/transcript", status_code=201)
+def realtime_transcript(
+    body: RealtimeTranscriptRequest,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Writes down a spoken turn.
+
+    Voice and text share one conversation: something said out loud has to be
+    in the history the text path reads back, or Luna forgets it the moment the
+    call ends.
+    """
+    user = require_user(authorization, db)
+
+    message = Message(
+        user_id=user.id,
+        role=body.role.upper(),
+        content=body.content.strip(),
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+    return serialize_message(message)
 
 
 @app.get("/api/meetings")

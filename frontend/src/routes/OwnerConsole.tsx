@@ -25,13 +25,11 @@ import { ViewTabs, type ViewTab } from '../components/ViewTabs';
  */
 
 export function OwnerConsole() {
-  const user = useAuthStore((s) => s.user);
   const accessToken = useAuthStore((s) => s.accessToken);
   const logout = useAuthStore((s) => s.logout);
 
   const [tab, setTab] = useState<ViewTab>('chat');
   const [selected, setSelected] = useState<Meeting | null>(null);
-  const [streaming, setStreaming] = useState(false);
 
   const chatRef = useRef<ChatPaneHandle | null>(null);
   const voiceRef = useRef<VoiceControllerHandle | null>(null);
@@ -39,24 +37,21 @@ export function OwnerConsole() {
   const supported = useVoiceStore((s) => s.supported);
   const permission = useVoiceStore((s) => s.permission);
   const voiceError = useVoiceStore((s) => s.error);
-  const interim = useVoiceStore((s) => s.interim);
   const voiceState = useVoiceStore((s) => s.state);
 
   const [voiceOpen, setVoiceOpen] = useState(false);
 
-  // The overlay is not simply "voice is on": the mic arms on load when
-  // permission is already granted, and a full-screen takeover on page load
-  // would be alarming. It opens when a turn actually starts — the owner taps
-  // the orb, or Luna hears her name — and closes when voice goes idle.
+  // The overlay follows the call rather than the turn: it is up for as long
+  // as the line is open, because with no button to hold there is nothing else
+  // telling the owner that Luna can still hear them.
+  //
+  // Going idle normally means they hung up, so the surface closes. When it
+  // went idle *because* something failed, closing would flash the overlay open
+  // and shut and leave them with no idea why — so it stays up holding the
+  // explanation until it is dismissed.
   useEffect(() => {
-    if (voiceState === 'capturing') setVoiceOpen(true);
-    // Voice going idle normally means the turn ended, so the surface closes.
-    // When it went idle *because* something failed, closing would flash the
-    // overlay open and shut and leave the owner with no idea why — so it stays
-    // up holding the explanation until it is dismissed.
-    if (voiceState === 'idle' && !useVoiceStore.getState().error) {
-      setVoiceOpen(false);
-    }
+    if (voiceState !== 'idle') setVoiceOpen(true);
+    else if (!useVoiceStore.getState().error) setVoiceOpen(false);
   }, [voiceState]);
 
   // The employee route puts the fetch wrapper into employee mode. Coming back
@@ -65,22 +60,18 @@ export function OwnerConsole() {
     installOwnerAuth();
   }, []);
 
-  const handleUtterance = useCallback((text: string) => {
-    chatRef.current?.send(text);
-  }, []);
-
-  const handleAssistantMessage = useCallback((text: string) => {
-    voiceRef.current?.speak(text);
-  }, []);
+  // Spoken turns are already said and already saved by the time they arrive;
+  // they only need to show up in the transcript alongside the typed ones.
+  const handleTurn = useCallback(
+    (role: 'user' | 'assistant', content: string) => {
+      chatRef.current?.appendMessage(role, content);
+    },
+    [],
+  );
 
   return (
     <div className="flex h-app flex-col bg-bg px-safe">
-      <VoiceController
-        ref={voiceRef}
-        onUtterance={handleUtterance}
-        token={accessToken}
-        streaming={streaming}
-      />
+      <VoiceController ref={voiceRef} token={accessToken} onTurn={handleTurn} />
 
       {/* One slim bar instead of a title row above a tab row. The owner knows
           whose console this is, so the name and timezone bought nothing and
@@ -120,17 +111,14 @@ export function OwnerConsole() {
             <ChatPane
               ref={chatRef}
               token={accessToken}
-              greeting={`Morning${user ? `, ${user.name.split(' ')[0]}` : ''}. What do you need?`}
-              interim={interim}
-              onAssistantMessage={handleAssistantMessage}
-              onStreamingChange={setStreaming}
+              greeting="Morning, boss. What do you need?"
               composerPlaceholder="Message Luna"
               composerLeading={
                 supported ? (
                   <MicOrb
                     onToggle={() => {
-                      // Arms voice if it is off, and always brings up the
-                      // voice surface — the small orb is the way in.
+                      // Opens the line if it is closed, and always brings up
+                      // the voice surface — the small orb is the way in.
                       if (useVoiceStore.getState().state === 'idle') {
                         voiceRef.current?.toggle();
                       }
@@ -159,11 +147,11 @@ export function OwnerConsole() {
       {voiceOpen ? (
         <VoiceOverlay
           onClose={() => {
-            voiceRef.current?.toggle();
+            voiceRef.current?.stop();
             setVoiceOpen(false);
           }}
-          onHoldStart={() => voiceRef.current?.startHold()}
-          onHoldEnd={() => voiceRef.current?.endHold()}
+          onHoldStart={() => voiceRef.current?.startTalking()}
+          onHoldEnd={() => voiceRef.current?.stopTalking()}
         />
       ) : null}
 
