@@ -24,6 +24,10 @@ from .database import SessionLocal
 from .models import Meeting, Message, User
 
 
+# A passed-on note, not a document. Anything longer is not something Luna
+# should be reading out or writing down on someone's behalf.
+MAX_MESSAGE_CHARS = 1_500
+
 MIN_DURATION_MIN = 15
 MAX_DURATION_MIN = 480
 DEFAULT_DURATION_MIN = 30
@@ -82,33 +86,20 @@ def team_boss(session: Session, actor: User) -> User | None:
     )
 
 
-def resolve_counterpart(
-    session: Session, actor: User, name: str | None
+def match_member(
+    candidates: list[User], name: str | None, purpose: str
 ) -> tuple[User | None, str | None]:
     """
-    Works out who a meeting is with, from a name the model supplied.
+    Matches a spoken name against a list of people.
 
-    An employee only ever meets the boss, so their side needs no matching. For
-    the boss, the name is matched against their own team and nowhere else.
-    Returns (person, error) — the error is text meant for the model to read
-    back to the user, not an exception, because "who did you mean?" is a
-    conversational outcome rather than a failure.
+    Exact on full name or username first, then a unique partial — speech gives
+    us "Rakib" for "Rakib Hasan" far more often than the whole thing. Anything
+    ambiguous comes back as text for the model to ask about, because "which
+    one did you mean?" is a conversational outcome rather than a failure.
     """
-    if actor.role == "EMPLOYEE":
-        boss = team_boss(session, actor)
-        if boss is None:
-            return None, "This team has no boss to meet with."
-        return boss, None
-
     needle = (name or "").strip().lower()
     if not needle:
-        return None, "No name was given. Ask who the meeting is with."
-
-    candidates = [
-        member
-        for member in team_members(session, actor)
-        if member.id != actor.id
-    ]
+        return None, f"No name was given. Ask who {purpose}."
 
     exact = [
         member
@@ -131,6 +122,66 @@ def resolve_counterpart(
 
     known = ", ".join(member.name for member in candidates) or "nobody"
     return None, f"There is no '{name}' on this team. The team is: {known}."
+
+
+def resolve_recipient(
+    session: Session, actor: User, name: str | None
+) -> tuple[User | None, str | None]:
+    """
+    Who a message may be passed to.
+
+    The boss can write to anyone on the team; everyone else can only write to
+    the boss. The same shape as who they can book with — but unlike booking,
+    the name still has to match: an employee who says "tell Nabila" must hear
+    that they cannot, not have it quietly delivered to the boss instead.
+    """
+    everyone = [m for m in team_members(session, actor) if m.id != actor.id]
+    candidates = everyone
+    if actor.role != "BOSS":
+        candidates = [m for m in everyone if m.role == "BOSS"]
+        if not candidates:
+            return None, "This team has no boss to pass a message to."
+
+    person, problem = match_member(candidates, name, "the message is for")
+    if person is not None:
+        return person, None
+
+    # Naming a real colleague they are not allowed to write to is a different
+    # thing from naming nobody, and saying "there is no Nabila" when Nabila is
+    # sitting two desks away would be a lie Luna then reads out.
+    blocked, _ = match_member(
+        [m for m in everyone if m not in candidates], name, "the message is for"
+    )
+    if blocked is not None:
+        allowed = ", ".join(m.name for m in candidates)
+        return None, (
+            f"{blocked.name} is on the team, but they can only pass messages "
+            f"to {allowed}. Say so, and do not send it to anyone else."
+        )
+
+    return None, problem
+
+
+def resolve_counterpart(
+    session: Session, actor: User, name: str | None
+) -> tuple[User | None, str | None]:
+    """
+    Works out who a meeting is with, from a name the model supplied.
+
+    An employee only ever meets the boss, so their side needs no matching. For
+    the boss, the name is matched against their own team and nowhere else.
+    Returns (person, error) — the error is text meant for the model to read
+    back to the user, not an exception, because "who did you mean?" is a
+    conversational outcome rather than a failure.
+    """
+    if actor.role == "EMPLOYEE":
+        boss = team_boss(session, actor)
+        if boss is None:
+            return None, "This team has no boss to meet with."
+        return boss, None
+
+    candidates = [m for m in team_members(session, actor) if m.id != actor.id]
+    return match_member(candidates, name, "the meeting is with")
 
 
 def visible_meetings(session: Session, actor: User):
@@ -424,6 +475,40 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["title", "start"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": (
+                "Pass a message to someone on the team. It lands in their chat "
+                "with Luna, attributed to the person who sent it. Write the "
+                "message yourself: take what the user said, or what you have "
+                "just been discussing, and put it in short, clear, organised "
+                "words. Keep every specific they gave — the deadline, the "
+                "number, the name — and add nothing they did not say. Read "
+                "your version back and get an explicit yes before calling "
+                "this; a sent message cannot be taken back."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "person": {
+                        "type": "string",
+                        "description": "Who it is for, by name as the user said it.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": (
+                            "Your rewritten message, as it should arrive. Not "
+                            "the user's words verbatim, and not a summary that "
+                            "drops the details."
+                        ),
+                    },
+                },
+                "required": ["person", "message"],
             },
         },
     },
@@ -735,6 +820,38 @@ def _notify(session: Session, meeting: Meeting, actor: User, text: str) -> str |
     return other.name
 
 
+def _send_message(session: Session, actor: User, args: dict, tz_name: str) -> dict:
+    recipient, problem = resolve_recipient(session, actor, args.get("person"))
+    if recipient is None:
+        return {"ok": False, "error": problem}
+
+    body = (args.get("message") or "").strip()
+    if not body:
+        return {"ok": False, "error": "There is nothing to send. Ask what to say."}
+    if len(body) > MAX_MESSAGE_CHARS:
+        return {
+            "ok": False,
+            "error": "That is too long to pass on. Ask them to shorten it.",
+        }
+
+    # Attributed, not ventriloquised. The recipient has to be able to tell
+    # that this came from a person, and which one — Luna is carrying it, not
+    # deciding it.
+    session.add(
+        Message(
+            user_id=recipient.id,
+            role="ASSISTANT",
+            content=(
+                f"Hey {recipient.name.split(' ')[0]} — {actor.name} asked me to "
+                f"pass this on:\n\n{body}"
+            ),
+        )
+    )
+    session.flush()
+
+    return {"ok": True, "sent_to": recipient.name, "message": body}
+
+
 def _reschedule_meeting(
     session: Session, actor: User, args: dict, tz_name: str
 ) -> dict:
@@ -819,6 +936,7 @@ def _cancel_meeting(session: Session, actor: User, args: dict, tz_name: str) -> 
 
 
 HANDLERS = {
+    "send_message": _send_message,
     "list_meetings": _list_meetings,
     "check_availability": _check_availability,
     "book_meeting": _book_meeting,

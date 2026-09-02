@@ -16,6 +16,7 @@ const TOOL_LABELS: Record<string, string> = {
   list_meetings: 'checking the calendar',
   check_availability: 'looking for open times',
   book_meeting: 'booking it in',
+  send_message: 'passing that on',
   reschedule_meeting: 'moving it',
   cancel_meeting: 'cancelling that',
 };

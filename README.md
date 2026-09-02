@@ -41,10 +41,12 @@ npm run dev -- --host 0.0.0.0
 - Persistent chat history and streamed OpenAI responses
 - Calendar tool-calling: Luna reads meetings, checks a time, and books it
 - Luna can also move and cancel meetings, by voice or by typing
+- Luna passes messages on, rewriting them short and organised first
 - Meetings are named by time and person, never by an id read aloud
 - Conflict detection offering real free slots inside working hours
 - Read-back and explicit confirmation before anything is written or undone
 - The other person is messaged when a meeting is booked, moved or cancelled
+- Passed-on messages arrive under the sender's name, not Luna's
 - Spoken wall-clock times resolved in the caller's timezone, stored as UTC
 - Environment-configurable chat, realtime, transcription and voice
 - Speech-to-speech voice mode over WebRTC — one model hears and answers
