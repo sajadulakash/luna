@@ -13,11 +13,11 @@ interface ThinkingIndicatorProps {
 
 /** Tool names are snake_case on the wire; these are the human readings. */
 const TOOL_LABELS: Record<string, string> = {
-  check_specific_time: 'checking the calendar',
-  find_slots: 'looking for open times',
+  list_meetings: 'checking the calendar',
+  check_availability: 'looking for open times',
   book_meeting: 'booking it in',
-  cancel_meeting: 'cancelling that',
   reschedule_meeting: 'moving it',
+  cancel_meeting: 'cancelling that',
 };
 
 function toolLabel(name: string): string {

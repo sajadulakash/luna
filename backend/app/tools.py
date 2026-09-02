@@ -133,6 +133,99 @@ def resolve_counterpart(
     return None, f"There is no '{name}' on this team. The team is: {known}."
 
 
+def visible_meetings(session: Session, actor: User):
+    """
+    The meetings this person is allowed to touch.
+
+    The boss manages the team's calendar; everyone else manages only what sits
+    on their own. Exactly the scoping `_list_meetings` uses, so nothing can be
+    changed that could not be read in the first place.
+    """
+    statement = (
+        select(Meeting)
+        .join(Meeting.user)
+        .options(joinedload(Meeting.user), joinedload(Meeting.created_by))
+        .where(Meeting.status != "CANCELLED")
+    )
+    return (
+        statement.where(User.team_id == actor.team_id)
+        if actor.role == "BOSS"
+        else statement.where(Meeting.user_id == actor.id)
+    )
+
+
+def resolve_meeting(
+    session: Session, actor: User, args: dict, tz_name: str
+) -> tuple[Meeting | None, str | None]:
+    """
+    Works out which meeting is meant, from however the user referred to it.
+
+    People do not say meeting ids out loud. They say "the four o'clock with
+    Rakib", or "the design review", or just "tomorrow's" — so this takes an
+    id when the model has one from a previous listing, and otherwise matches
+    on start time, the other person, and the title, in that order of strength.
+
+    Like `resolve_counterpart`, an ambiguous or missing match comes back as
+    text for the model to say out loud rather than as an exception: "which
+    one did you mean?" is a conversational outcome, not a failure.
+    """
+    raw_id = args.get("meeting_id")
+    if raw_id not in (None, ""):
+        try:
+            meeting_id = int(str(raw_id).strip())
+        except (TypeError, ValueError):
+            return None, "That is not a meeting I can look up."
+        meeting = session.scalar(visible_meetings(session, actor).where(Meeting.id == meeting_id))
+        if meeting is None:
+            return None, "That meeting is not on the calendar any more."
+        return meeting, None
+
+    candidates = list(session.scalars(visible_meetings(session, actor).order_by(Meeting.start_at)))
+
+    start_text = (args.get("start") or "").strip()
+    if start_text:
+        try:
+            start = parse_local(start_text, tz_name)
+        except ValueError:
+            return None, "start must look like 2026-08-27T16:00."
+        # Anything running at that moment, not just starting on it — people
+        # say "the three o'clock" about a meeting that began at half past two.
+        candidates = [
+            m for m in candidates if m.start_at <= start < m.end_at or m.start_at == start
+        ]
+
+    person = (args.get("person") or "").strip().lower()
+    if person:
+        candidates = [
+            m
+            for m in candidates
+            if person in m.user.name.lower()
+            or (m.created_by is not None and person in m.created_by.name.lower())
+        ]
+
+    title = (args.get("title") or "").strip().lower()
+    if title:
+        narrowed = [m for m in candidates if title in m.title.lower()]
+        # Only if it actually helps: a title guessed from speech should not
+        # rule out the one meeting that matched the time.
+        if narrowed:
+            candidates = narrowed
+
+    if not candidates:
+        return None, (
+            "There is no meeting matching that. Read back what is on the "
+            "calendar and ask which one they meant."
+        )
+    if len(candidates) > 1:
+        described = "; ".join(
+            f"{m.title} with {m.user.name} at {format_local(m.start_at, tz_name)}"
+            for m in candidates[:4]
+        )
+        return None, f"That matches more than one meeting: {described}. Ask which one."
+
+    return candidates[0], None
+
+
 # --- Availability -----------------------------------------------------------
 
 
@@ -334,6 +427,98 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "reschedule_meeting",
+            "description": (
+                "Move an existing meeting to a different time. Use this when "
+                "someone wants a meeting delayed, brought forward or moved. "
+                "Say which meeting by its start time and who it is with; only "
+                "pass meeting_id if you read it from list_meetings. Confirm "
+                "the change with the user before calling this — it rewrites "
+                "the calendar and tells the other person."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "new_start": {
+                        "type": "string",
+                        "description": (
+                            "The new local start time, YYYY-MM-DDTHH:MM, in "
+                            "the user's timezone. Never a UTC time."
+                        ),
+                    },
+                    "start": {
+                        "type": "string",
+                        "description": (
+                            "The meeting's current local start time, "
+                            "YYYY-MM-DDTHH:MM. This is how you say which "
+                            "meeting to move."
+                        ),
+                    },
+                    "person": {
+                        "type": "string",
+                        "description": "Who the meeting is with, to tell two apart.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Part of the meeting's subject, to tell two apart.",
+                    },
+                    "meeting_id": {
+                        "type": "string",
+                        "description": "Only if you read it from list_meetings.",
+                    },
+                    "duration_minutes": {
+                        "type": "integer",
+                        "description": (
+                            "Only to change the length as well. Leave it out "
+                            "to keep the meeting as long as it already is."
+                        ),
+                    },
+                },
+                "required": ["new_start"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_meeting",
+            "description": (
+                "Cancel a meeting and tell the other person. Say which one by "
+                "its start time and who it is with; only pass meeting_id if "
+                "you read it from list_meetings. Always read the meeting back "
+                "and get an explicit yes before calling this — it takes the "
+                "meeting off the calendar and cannot be undone from here."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {
+                        "type": "string",
+                        "description": (
+                            "The meeting's local start time, "
+                            "YYYY-MM-DDTHH:MM. This is how you say which one."
+                        ),
+                    },
+                    "person": {
+                        "type": "string",
+                        "description": "Who the meeting is with, to tell two apart.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Part of the meeting's subject, to tell two apart.",
+                    },
+                    "meeting_id": {
+                        "type": "string",
+                        "description": "Only if you read it from list_meetings.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 TOOL_NAMES = frozenset(
@@ -528,14 +713,121 @@ def _book_meeting(
     }
 
 
+def _notify(session: Session, meeting: Meeting, actor: User, text: str) -> str | None:
+    """
+    Tells the other side what changed.
+
+    The person to tell is whoever is not doing the telling: when the boss moves
+    a meeting the employee hears about it, and when an employee moves their own
+    the boss does. Returns their name, or None when there is nobody to tell.
+    """
+    other = meeting.created_by if meeting.user_id == actor.id else meeting.user
+    if other is None or other.id == actor.id:
+        return None
+
+    session.add(
+        Message(
+            user_id=other.id,
+            role="ASSISTANT",
+            content=f"Hey {other.name.split(' ')[0]} — {text}",
+        )
+    )
+    return other.name
+
+
+def _reschedule_meeting(
+    session: Session, actor: User, args: dict, tz_name: str
+) -> dict:
+    meeting, problem = resolve_meeting(session, actor, args, tz_name)
+    if meeting is None:
+        return {"ok": False, "error": problem}
+
+    try:
+        new_start = parse_local(args["new_start"], tz_name)
+    except (KeyError, ValueError):
+        return {"ok": False, "error": "new_start must look like 2026-08-27T16:00."}
+
+    # Keeps its current length unless asked otherwise.
+    duration = (
+        clamp_duration(args["duration_minutes"])
+        if args.get("duration_minutes") is not None
+        else int((meeting.end_at - meeting.start_at).total_seconds() // 60)
+    )
+    new_end = new_start + timedelta(minutes=duration)
+
+    if new_start <= datetime.now(timezone.utc):
+        return {
+            "ok": False,
+            "error": "That time is in the past. Ask for a time later than now.",
+        }
+
+    was = format_local(meeting.start_at, tz_name)
+
+    # Excluding itself, or a meeting would always collide with where it
+    # already is and nothing could ever be moved by ten minutes.
+    conflicts = find_conflicts(
+        session, actor.team_id, new_start, new_end, exclude_id=meeting.id
+    )
+    if conflicts:
+        return {
+            "ok": False,
+            "reason": "conflict",
+            "error": "That time is already taken. Offer the alternatives.",
+            "conflicts": [describe_meeting(row, tz_name) for row in conflicts],
+            "alternatives": suggest_slots(
+                session, actor.team_id, new_start, duration, tz_name
+            ),
+        }
+
+    meeting.start_at = new_start
+    meeting.end_at = new_end
+    session.flush()
+
+    notified = _notify(
+        session,
+        meeting,
+        actor,
+        f'"{meeting.title}" has moved from {was} to '
+        f"{format_local(new_start, tz_name)}, for {duration} minutes.",
+    )
+    return {
+        "ok": True,
+        "moved": describe_meeting(meeting, tz_name),
+        "was": was,
+        "notified": notified,
+    }
+
+
+def _cancel_meeting(session: Session, actor: User, args: dict, tz_name: str) -> dict:
+    meeting, problem = resolve_meeting(session, actor, args, tz_name)
+    if meeting is None:
+        return {"ok": False, "error": problem}
+
+    # Cancelled, not deleted: the row stays so the meeting can be accounted
+    # for afterwards, and every read already filters CANCELLED out.
+    cancelled = describe_meeting(meeting, tz_name)
+    meeting.status = "CANCELLED"
+    session.flush()
+
+    notified = _notify(
+        session,
+        meeting,
+        actor,
+        f'"{meeting.title}" on {cancelled["when"]} has been cancelled.',
+    )
+    return {"ok": True, "cancelled": cancelled, "notified": notified}
+
+
 HANDLERS = {
     "list_meetings": _list_meetings,
     "check_availability": _check_availability,
     "book_meeting": _book_meeting,
+    "reschedule_meeting": _reschedule_meeting,
+    "cancel_meeting": _cancel_meeting,
 }
 
 # Tools that change the calendar, so the caller knows to tell the UI to refresh.
-WRITE_TOOLS = frozenset({"book_meeting"})
+WRITE_TOOLS = frozenset({"book_meeting", "reschedule_meeting", "cancel_meeting"})
 
 
 def execute_tool(
