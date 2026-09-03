@@ -88,14 +88,19 @@ def build_system_prompt(
     now = datetime.now(timezone.utc).astimezone(zone(tz_name))
     stamp = now.strftime("%A, %d %B %Y at %I:%M %p").replace(" 0", " ")
     who = "the boss" if role == "BOSS" else "an employee"
-    # The boss is addressed by his title, not his name: "yes boss", never
-    # "yes Rafi". Everyone else gets their first name.
+    # The boss is addressed by title rather than by name — but sparingly. The
+    # earlier wording gave "yes boss" as the example and got it back as the
+    # opening words of every single reply, which reads like a servant rather
+    # than an assistant.
     address = (
-        f'Address them as "boss" — "yes boss", never "yes {name}". Their name '
-        f"is still {name} and you should say so if they ask; it is only the "
-        "form of address that is by title."
+        f'When you do address them, it is "boss", never "{name}" — their name '
+        f"is still {name} and you should say it if they ask; it is only the "
+        "form of address that goes by title. Use it sparingly. Most replies "
+        "need no form of address at all, and should simply answer. Never open "
+        "a reply with it, and never use it twice in one reply."
         if role == "BOSS"
-        else f"Address them by their first name, {name.split(' ')[0]}."
+        else f"Address them by their first name, {name.split(' ')[0]}, and "
+        "sparingly — most replies need no name in them at all."
     )
     team = "\n".join(
         f"  - {member} ({'boss' if member_role == 'BOSS' else 'employee'})"

@@ -46,6 +46,24 @@ const RELEASE_TAIL_MS = 250;
 /** Shorter than this is a mis-tap, and committing it errors on an empty buffer. */
 const MIN_HOLD_MS = 200;
 
+/**
+ * Errors that are a consequence of interrupting, not a fault worth showing.
+ *
+ * Cutting someone off is inherently racy: the response can finish in the
+ * moment between deciding to cancel it and the cancel arriving, and clearing
+ * an audio buffer that has already drained is not a failure either. Surfacing
+ * these would put a red banner on the screen and drop the call every time
+ * someone interrupted at an awkward moment.
+ */
+function isInterruptNoise(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes('no active response') ||
+    m.includes('cancellation failed') ||
+    m.includes('output_audio_buffer')
+  );
+}
+
 export type VoiceAvailability = 'ok' | 'unsupported' | 'insecure';
 
 /**
@@ -272,9 +290,26 @@ export function useRealtimeSession({ token, onTurn }: RealtimeSessionOptions) {
       releaseTimerRef.current = null;
     }
 
+    // Cutting her off takes three things, because the audio is in three
+    // places at once. Cancelling only stops her composing more of it; what
+    // has already been generated, and what has already reached the speakers,
+    // both carry on regardless — which is why she used to keep talking over
+    // the press.
     if (store.state === 'speaking' || store.state === 'thinking') {
+      // 1. Stop generating.
       send({ type: 'response.cancel' });
+      // 2. Drop what the server has generated but not yet played. This is
+      //    the WebRTC form; a WebSocket client would truncate by timestamp
+      //    instead. Under push-to-talk the server does no interruption
+      //    handling of its own, so nothing does this unless we do.
+      send({ type: 'output_audio_buffer.clear' });
     }
+
+    // 3. Silence what is already in the browser, in this same tick. The two
+    //    events above travel to a server and back; this does not, so the
+    //    room goes quiet on the press rather than a round trip later.
+    const speaker = audioRef.current;
+    if (speaker) speaker.muted = true;
 
     // Drop whatever silence accumulated since the last turn, so the commit
     // carries your sentence and nothing else.
@@ -351,6 +386,12 @@ export function useRealtimeSession({ token, onTurn }: RealtimeSessionOptions) {
         case 'response.output_audio_transcript.delta': {
           const delta = typeof event.delta === 'string' ? event.delta : '';
           if (delta) {
+            // She is speaking again, so let her be heard. Unmuting here rather
+            // than on release means the speakers stay shut for the whole of
+            // the user's turn, including the pause while she thinks.
+            const speaker = audioRef.current;
+            if (speaker) speaker.muted = false;
+
             // The first audio and the first transcript land together, so this
             // doubles as the cue that she has started speaking.
             store.dispatch('FIRST_AUDIO');
@@ -393,6 +434,9 @@ export function useRealtimeSession({ token, onTurn }: RealtimeSessionOptions) {
             typeof (detail as { message?: unknown }).message === 'string'
               ? (detail as { message: string }).message
               : 'Something went wrong on the voice connection.';
+
+          if (isInterruptNoise(message)) break;
+
           store.setError(message);
           store.dispatch('ERROR');
           break;
@@ -459,6 +503,9 @@ export function useRealtimeSession({ token, onTurn }: RealtimeSessionOptions) {
       // document: it needs no controls and nothing should be able to style it.
       const el = audioRef.current ?? new Audio();
       el.autoplay = true;
+      // The element outlives the connection, so a call that ended mid-barge-in
+      // would otherwise hand the next one a muted speaker.
+      el.muted = false;
       audioRef.current = el;
 
       pc.ontrack = (event) => {
