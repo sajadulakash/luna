@@ -13,6 +13,7 @@ import {
 } from '../features/voice/VoiceController';
 import { VoiceOverlay } from '../features/voice/VoiceOverlay';
 import { ViewTabs, type ViewTab } from '../components/ViewTabs';
+import { NotificationBell } from '../components/NotificationBell';
 
 /**
  * / — the owner's console.
@@ -75,11 +76,15 @@ export function OwnerConsole() {
       <div className="flex items-center border-b border-line bg-surface pt-safe">
         <ViewTabs active={tab} onChange={setTab} className="flex-1 lg:hidden" />
 
+        <div className="ml-auto flex items-center lg:ml-auto">
+          <NotificationBell />
+        </div>
+
         <button
           type="button"
           onClick={() => void logout()}
           aria-label="Sign out"
-          className="tap ml-auto flex shrink-0 items-center justify-center px-16 text-faint transition-colors duration-150 ease-out hover:text-ink"
+          className="tap flex shrink-0 items-center justify-center px-16 text-faint transition-colors duration-150 ease-out hover:text-ink"
         >
           <LogOut size={18} aria-hidden="true" />
         </button>

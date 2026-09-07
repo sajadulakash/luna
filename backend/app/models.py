@@ -136,7 +136,7 @@ class Meeting(Base):
     __tablename__ = "meetings"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('CONFIRMED', 'CANCELLED')",
+            "status IN ('PENDING', 'CONFIRMED', 'DECLINED', 'CANCELLED')",
             name="ck_meetings_status",
         ),
         CheckConstraint("end_at > start_at", name="ck_meetings_time_range"),
@@ -153,6 +153,9 @@ class Meeting(Base):
     notes: Mapped[str | None] = mapped_column(Text)
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # PENDING when an employee asks for it and the boss has not answered yet;
+    # CONFIRMED once it is really on the calendar; DECLINED if the boss said
+    # no, which is different from CANCELLED — it never was a meeting.
     status: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
@@ -181,3 +184,43 @@ class Meeting(Base):
         lazy="selectin",
         order_by="User.name",
     )
+
+
+class Notification(Base):
+    """
+    Something that happened, waiting to be seen.
+
+    Separate from Message because the two are different things: a message is
+    prose in a conversation, while this has a kind, a read state, and — for a
+    meeting request — two buttons that stop working the moment either is
+    pressed. Putting an Approve button inside a chat bubble would mean
+    answering the question of what it does when you scroll back to it a week
+    later.
+    """
+
+    __tablename__ = "notifications"
+    __table_args__ = (
+        Index("ix_notifications_user_unread", "user_id", "read_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    # SET NULL, not CASCADE: "your request was declined" outlives the row it
+    # refers to.
+    meeting_id: Mapped[int | None] = mapped_column(
+        ForeignKey("meetings.id", ondelete="SET NULL"),
+    )
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    user: Mapped[User] = relationship(foreign_keys=[user_id])
+    meeting: Mapped["Meeting | None"] = relationship(foreign_keys=[meeting_id])

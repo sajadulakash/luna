@@ -59,7 +59,24 @@ npm run dev -- --host 0.0.0.0
 - The browser gets a short-lived session key, never the API key
 - Voice works in Chrome, Edge, Safari and Firefox, on desktop and mobile
 - Meeting creation, conflict detection, cancellation, and rescheduling
+- Employee requests wait for the boss's approval before they are scheduled
+- A notification panel in both views, with Approve and Decline in it
 - Mobile-first Chat/Calendar workspaces with local HTTPS support
+
+## Approvals
+
+An employee cannot put time on the calendar themselves. Asking Luna for a
+meeting saves it `PENDING` and puts a request in the boss's notification
+panel, with Approve and Decline on it. Only approving schedules it; declining
+marks it `DECLINED`, which is not the same as `CANCELLED` — it never was a
+meeting. Either way the employee is told in their own panel.
+
+A pending request holds no time: it does not appear on a calendar and does not
+block anyone else's booking. The slot is checked again at the moment of
+approval, so a request that sat for a day cannot silently double-book the boss
+— it fails and names what it clashed with.
+
+The boss books directly, with no approval step, exactly as before.
 
 ## Voice
 
@@ -125,6 +142,7 @@ The development database has four tables:
 teams
 └── users                      # name, email, phone, department
     ├── messages
+    ├── notifications
     └── meetings ── meeting_attendees ── users
 ```
 

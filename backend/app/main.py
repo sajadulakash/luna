@@ -21,12 +21,12 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session, joinedload
 
 from .config import get_settings
 from .database import SessionLocal, get_db
-from .models import Meeting, Message, Team, User
+from .models import Meeting, Message, Notification, Team, User
 from .schemas import (
     ChatRequest,
     CreateMeetingRequest,
@@ -43,6 +43,9 @@ from .security import access_token_for, hash_password, verify_password
 from .services.openai_client import OpenAIClient, OpenAIError
 from .tools import (
     TOOL_NAMES,
+    notify,
+    other_people,
+    spoken_list,
     TOOL_SCHEMAS,
     WRITE_TOOLS,
     execute_tool,
@@ -157,6 +160,11 @@ question at a time. Then read all four back and wait for the user to confirm
 in their next message. Only call book_meeting after that confirmation — it
 writes to the calendar and messages the other person, so never call it to
 "check" anything.
+
+Employees cannot book time themselves — their meetings go to the boss as a
+request. When you make one for them, say it has been sent for approval and
+that they will be told the answer. Never say it is booked, scheduled or
+confirmed until it actually is.
 
 You can also move and cancel meetings. Both rewrite the calendar and message
 the other person, so both follow the same rule: work out exactly which meeting
@@ -1003,6 +1011,169 @@ def realtime_transcript(
     return serialize_message(message)
 
 
+def serialize_notification(item: Notification) -> dict[str, Any]:
+    meeting = item.meeting
+    # Actionable only while there is still a decision to make. Once the boss
+    # has answered — or the meeting has gone — the buttons must not come back,
+    # however old the panel on someone's screen is.
+    actionable = (
+        item.kind == "MEETING_REQUEST"
+        and meeting is not None
+        and meeting.status == "PENDING"
+    )
+    return {
+        "id": str(item.id),
+        "kind": item.kind,
+        "body": item.body,
+        "created_at": iso(item.created_at),
+        "read": item.read_at is not None,
+        "actionable": actionable,
+        "meeting": serialize_meeting(meeting) if meeting is not None else None,
+    }
+
+
+@app.get("/api/notifications")
+def notifications(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Everything waiting for this person, newest first."""
+    user = require_user(authorization, db)
+
+    rows = db.scalars(
+        select(Notification)
+        .options(
+            joinedload(Notification.meeting).joinedload(Meeting.user),
+            joinedload(Notification.meeting).joinedload(Meeting.created_by),
+        )
+        .where(Notification.user_id == user.id)
+        .order_by(Notification.id.desc())
+        .limit(50)
+    ).unique().all()
+
+    items = [serialize_notification(row) for row in rows]
+    return {
+        "notifications": items,
+        # What the badge shows: unread, plus anything still needing an answer,
+        # because a request you have looked at is still a request.
+        "unread": sum(1 for i in items if not i["read"] or i["actionable"]),
+    }
+
+
+@app.post("/api/notifications/read", status_code=204)
+def mark_notifications_read(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> None:
+    """Marks everything seen. Requests stay actionable until answered."""
+    user = require_user(authorization, db)
+    db.execute(
+        update(Notification)
+        .where(Notification.user_id == user.id, Notification.read_at.is_(None))
+        .values(read_at=func.now())
+    )
+    db.commit()
+
+
+def pending_request(db: Session, boss: User, meeting_id: int) -> Meeting | None:
+    return db.scalar(
+        select(Meeting)
+        .join(Meeting.user)
+        .options(joinedload(Meeting.user), joinedload(Meeting.created_by))
+        .where(
+            Meeting.id == meeting_id,
+            Meeting.status == "PENDING",
+            User.team_id == boss.team_id,
+        )
+    )
+
+
+@app.post("/api/meetings/{meeting_id}/approve")
+def approve_meeting(
+    meeting_id: int,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> Any:
+    """
+    Turns a request into a meeting.
+
+    The slot is checked again here rather than trusted from when it was asked
+    for: a request can sit for a day, and the boss may well have booked over
+    it in the meantime. Approving into an occupied slot would double-book them
+    silently, so it fails instead and says what it clashed with.
+    """
+    boss = require_boss(authorization, db)
+    meeting = pending_request(db, boss, meeting_id)
+    if meeting is None:
+        return api_error(404, "not_pending", "That request has already been answered.")
+
+    clash = db.scalar(
+        select(Meeting)
+        .join(Meeting.user)
+        .where(
+            User.team_id == boss.team_id,
+            Meeting.status == "CONFIRMED",
+            Meeting.id != meeting.id,
+            Meeting.start_at < meeting.end_at,
+            Meeting.end_at > meeting.start_at,
+        )
+    )
+    if clash is not None:
+        return api_error(
+            409,
+            "conflict",
+            f'That time is taken by "{clash.title}". Decline it, or move that first.',
+        )
+
+    meeting.status = "CONFIRMED"
+    requester = meeting.created_by or meeting.user
+    when = iso(meeting.start_at)
+
+    for person in {p.id: p for p in [*meeting.attendees, requester]}.values():
+        if person.id == boss.id:
+            continue
+        notify(
+            db,
+            person,
+            "MEETING_APPROVED",
+            f'{boss.name} approved "{meeting.title}". It is on the calendar.',
+            meeting,
+        )
+    db.commit()
+    db.refresh(meeting)
+    return {"meeting": serialize_meeting(meeting), "starts_at": when}
+
+
+@app.post("/api/meetings/{meeting_id}/decline")
+def decline_meeting(
+    meeting_id: int,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Refuses a request. Declined, not cancelled — it never was a meeting."""
+    boss = require_boss(authorization, db)
+    meeting = pending_request(db, boss, meeting_id)
+    if meeting is None:
+        return api_error(404, "not_pending", "That request has already been answered.")
+
+    meeting.status = "DECLINED"
+    requester = meeting.created_by or meeting.user
+
+    for person in {p.id: p for p in [*meeting.attendees, requester]}.values():
+        if person.id == boss.id:
+            continue
+        notify(
+            db,
+            person,
+            "MEETING_DECLINED",
+            f'{boss.name} declined "{meeting.title}". It has not been scheduled.',
+            meeting,
+        )
+    db.commit()
+    db.refresh(meeting)
+    return {"meeting": serialize_meeting(meeting)}
+
+
 @app.get("/api/meetings")
 def meetings(
     from_value: str = Query(default="", alias="from"),
@@ -1011,7 +1182,7 @@ def meetings(
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
     user = require_user(authorization, db)
-    statement = team_meeting_statement(user).where(Meeting.status != "CANCELLED")
+    statement = team_meeting_statement(user).where(Meeting.status == "CONFIRMED")
 
     if from_value and to:
         try:
@@ -1053,7 +1224,7 @@ def create_meeting(
 
     conflict = db.scalar(
         team_meeting_statement(user).where(
-            Meeting.status != "CANCELLED",
+            Meeting.status == "CONFIRMED",
             Meeting.start_at < end,
             Meeting.end_at > start,
         )

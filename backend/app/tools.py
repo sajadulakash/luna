@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from .database import SessionLocal
-from .models import Meeting, Message, User
+from .models import Meeting, Message, Notification, User
 
 
 # A passed-on note, not a document. Anything longer is not something Luna
@@ -235,7 +235,7 @@ def visible_meetings(session: Session, actor: User):
         select(Meeting)
         .join(Meeting.user)
         .options(joinedload(Meeting.user), joinedload(Meeting.created_by))
-        .where(Meeting.status != "CANCELLED")
+        .where(Meeting.status == "CONFIRMED")
     )
     return (
         statement.where(User.team_id == actor.team_id)
@@ -339,7 +339,9 @@ def find_conflicts(
         .options(joinedload(Meeting.user), joinedload(Meeting.created_by))
         .where(
             User.team_id == team_id,
-            Meeting.status != "CANCELLED",
+            # A pending request holds no time: it is not scheduled until the
+            # boss says so, and the slot is checked again at that moment.
+            Meeting.status == "CONFIRMED",
             Meeting.start_at < end,
             Meeting.end_at > start,
         )
@@ -479,7 +481,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "book_meeting",
             "description": (
-                "Book one meeting and notify everyone in it. A meeting can "
+                "Book one meeting, or — if you are speaking to an employee — "
+                "request one. An employee's meeting is not scheduled until the "
+                "boss approves it, and the tool result says which happened: "
+                "never tell an employee a meeting is booked when the result "
+                "says PENDING. A meeting can "
                 "have several people — put them all in `people` and it books "
                 "as a single entry they all share, not one each. Only call "
                 "this after the user has explicitly confirmed who, subject, "
@@ -749,7 +755,7 @@ def _list_meetings(
         .join(Meeting.user)
         .options(joinedload(Meeting.user), joinedload(Meeting.created_by))
         .where(
-            Meeting.status != "CANCELLED",
+            Meeting.status == "CONFIRMED",
             Meeting.start_at < end_local.astimezone(timezone.utc),
             Meeting.end_at > start_local.astimezone(timezone.utc),
         )
@@ -838,6 +844,11 @@ def _book_meeting(
             ),
         }
 
+    # The boss books; everyone else asks. A request holds no time on the
+    # calendar until it is approved, which is also when the slot is checked
+    # again — the world may have moved on while it sat there.
+    requesting = actor.role != "BOSS"
+
     # One meeting, however many people are in it. user_id is the first
     # attendee — the team-scoping joins hang off it — and `attendees` is the
     # whole room.
@@ -848,45 +859,96 @@ def _book_meeting(
         notes=notes,
         start_at=start,
         end_at=end,
-        status="CONFIRMED",
+        status="PENDING" if requesting else "CONFIRMED",
     )
     meeting.attendees = list(people)
     session.add(meeting)
     session.flush()
 
+    detail = f" {notes}" if notes else ""
+    when = format_local(start, tz_name)
+
+    if requesting:
+        boss = team_boss(session, actor)
+        if boss is None:
+            return {"ok": False, "error": "This team has no boss to approve it."}
+
+        notify(
+            session,
+            boss,
+            "MEETING_REQUEST",
+            f'{actor.name} has asked for a meeting: "{title}" on {when}, '
+            f"for {duration} minutes.{detail}",
+            meeting,
+        )
+        return {
+            "ok": True,
+            "status": "PENDING",
+            "requested": describe_meeting(meeting, tz_name, actor),
+            "awaiting": boss.name,
+            "say": (
+                f"The request has gone to {boss.name}. Tell them it is waiting "
+                "for approval and that they will hear as soon as it is answered "
+                "— do not tell them it is booked."
+            ),
+        }
+
     # Everyone in the room hears about it, and each is told who else is in it
     # rather than just who called the meeting.
-    detail = f" {notes}" if notes else ""
     for person in people:
         others = spoken_list(other_people(meeting, person))
-        session.add(
-            Message(
-                user_id=person.id,
-                role="ASSISTANT",
-                content=(
-                    f"Hey {person.name.split(' ')[0]} — you have a meeting with "
-                    f'{others}: "{title}" on {format_local(start, tz_name)}, '
-                    f"for {duration} minutes.{detail}"
-                ),
-            )
+        notify(
+            session,
+            person,
+            "MEETING_BOOKED",
+            f'You have a meeting with {others}: "{title}" on {when}, '
+            f"for {duration} minutes.{detail}",
+            meeting,
         )
 
     return {
         "ok": True,
+        "status": "CONFIRMED",
         "booked": describe_meeting(meeting, tz_name, actor),
         "notified": spoken_list([person.name for person in people]),
     }
 
 
-def _notify(session: Session, meeting: Meeting, actor: User, text: str) -> str | None:
+def notify(
+    session: Session,
+    user: User,
+    kind: str,
+    body: str,
+    meeting: Meeting | None = None,
+) -> None:
+    """Drops something in someone's notification panel."""
+    session.add(
+        Notification(
+            user_id=user.id,
+            kind=kind,
+            body=body,
+            meeting_id=meeting.id if meeting is not None else None,
+        )
+    )
+
+
+def _notify(
+    session: Session,
+    meeting: Meeting,
+    actor: User,
+    text: str,
+    kind: str = "MEETING_UPDATED",
+) -> str | None:
     """
     Tells everyone else in the meeting what changed.
 
     Everyone involved except whoever is doing the telling — every attendee,
     plus whoever arranged it. With several people in a meeting this is the
     difference between one person hearing that it moved and the room hearing.
-    Returns their names as they would be said aloud, or None when there is
-    nobody to tell.
+
+    These land in the notification panel rather than the chat. A booking being
+    moved is an event with a state, not something Luna said; passing on a
+    message from a colleague is the opposite, and stays in the conversation.
     """
     involved = list(meeting.attendees) or [meeting.user]
     if meeting.created_by is not None:
@@ -899,13 +961,7 @@ def _notify(session: Session, meeting: Meeting, actor: User, text: str) -> str |
             continue
         seen.add(person.id)
         told.append(person.name)
-        session.add(
-            Message(
-                user_id=person.id,
-                role="ASSISTANT",
-                content=f"Hey {person.name.split(' ')[0]} — {text}",
-            )
-        )
+        notify(session, person, kind, text, meeting)
 
     return spoken_list(told) if told else None
 
@@ -996,6 +1052,7 @@ def _reschedule_meeting(
         actor,
         f'"{meeting.title}" has moved from {was} to '
         f"{format_local(new_start, tz_name)}, for {duration} minutes.",
+        kind="MEETING_MOVED",
     )
     return {
         "ok": True,
@@ -1021,6 +1078,7 @@ def _cancel_meeting(session: Session, actor: User, args: dict, tz_name: str) -> 
         meeting,
         actor,
         f'"{meeting.title}" on {cancelled["when"]} has been cancelled.',
+        kind="MEETING_CANCELLED",
     )
     return {"ok": True, "cancelled": cancelled, "notified": notified}
 

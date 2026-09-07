@@ -4,6 +4,7 @@ import type { Meeting } from '../api/types';
 import { useAuthStore } from '../stores/authStore';
 import { ChatPane } from '../features/chat/ChatPane';
 import { ViewTabs, type ViewTab } from '../components/ViewTabs';
+import { NotificationBell } from '../components/NotificationBell';
 import { WeekView } from '../features/calendar/WeekView';
 import { MeetingDetail } from '../features/calendar/MeetingDetail';
 
@@ -32,6 +33,7 @@ export function EmployeeChat() {
       <div className="mx-auto flex h-full max-w-chat flex-col">
         <div className="flex items-center border-b border-line bg-surface pt-safe">
           <ViewTabs active={tab} onChange={setTab} className="flex-1" />
+          <NotificationBell />
           <button
             type="button"
             onClick={() => void logout()}
@@ -51,7 +53,7 @@ export function EmployeeChat() {
               composerPlaceholder="Message Luna"
             />
           ) : (
-            <WeekView token={accessToken} onSelectMeeting={setSelected} />
+            <WeekView onSelectMeeting={setSelected} />
           )}
         </div>
       </div>
