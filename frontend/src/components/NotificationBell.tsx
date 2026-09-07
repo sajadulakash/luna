@@ -78,7 +78,21 @@ export function NotificationBell() {
         <div
           role="dialog"
           aria-label="Notifications"
-          className="absolute right-8 top-full z-30 max-h-[70vh] w-[min(360px,calc(100vw-32px))] overflow-y-auto rounded-card border border-line bg-surface motion-safe:animate-luna-rise"
+          className={[
+            // On a phone the bell is not at the screen edge — sign-out sits to
+            // its right — so hanging a fixed-width panel off it pushes the far
+            // side past the left of the screen. Below `sm` it is anchored to
+            // the viewport instead, inset equally on both sides, which cannot
+            // overflow whatever the header happens to contain.
+            'fixed inset-x-16 top-[calc(env(safe-area-inset-top,0px)+52px)] z-30',
+            'max-h-[min(70dvh,480px)] overflow-y-auto overscroll-contain',
+            'rounded-card border border-line bg-surface',
+            'shadow-[0_8px_24px_rgba(0,0,0,0.14)]',
+            // From `sm` up there is room to hang it off the bell as a normal
+            // dropdown.
+            'sm:absolute sm:inset-x-auto sm:right-0 sm:top-full sm:mt-4 sm:w-[360px]',
+            'motion-safe:animate-luna-rise',
+          ].join(' ')}
         >
           {items.length === 0 ? (
             <p className="px-16 py-24 text-center text-13 text-muted">
@@ -117,8 +131,8 @@ function NotificationRow({ item }: { item: Notification }) {
   };
 
   return (
-    <div className={`flex flex-col gap-8 px-16 py-12 ${item.read ? '' : 'bg-accent-soft'}`}>
-      <p className="text-15 text-ink">{item.body}</p>
+    <div className={`flex min-w-0 flex-col gap-8 px-16 py-12 ${item.read ? '' : 'bg-accent-soft'}`}>
+      <p className="break-words text-15 text-ink">{item.body}</p>
 
       {item.meeting ? (
         <p className="tnum font-mono text-12 text-muted">
