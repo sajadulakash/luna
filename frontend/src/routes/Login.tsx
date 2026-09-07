@@ -1,14 +1,18 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { Navigate, useNavigate } from 'react-router-dom';
+import { Link, Navigate, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
+import { homeFor } from '../App';
 
 /**
- * /login — centred card, username and password, one button.
- * Errors inline beneath the field. Nothing else.
+ * /login — one door for everyone.
+ *
+ * The boss and the employees sign in the same way, and where they land is
+ * decided by their role rather than by which page they arrived at.
  */
 export function Login() {
   const navigate = useNavigate();
   const status = useAuthStore((s) => s.status);
+  const user = useAuthStore((s) => s.user);
   const error = useAuthStore((s) => s.error);
   const login = useAuthStore((s) => s.login);
   const restore = useAuthStore((s) => s.restore);
@@ -22,7 +26,9 @@ export function Login() {
     if (status === 'unknown') void restore();
   }, [restore, status]);
 
-  if (status === 'authenticated') return <Navigate to="/" replace />;
+  if (status === 'authenticated' && user) {
+    return <Navigate to={homeFor(user.role)} replace />;
+  }
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -32,19 +38,22 @@ export function Login() {
     const ok = await login(username, password);
     setSubmitting(false);
 
-    if (ok) navigate('/', { replace: true });
+    if (ok) {
+      const signedIn = useAuthStore.getState().user;
+      navigate(signedIn ? homeFor(signedIn.role) : '/', { replace: true });
+    }
   };
 
   return (
     <main className="flex h-app items-center justify-center bg-bg px-24 px-safe">
       <div className="w-full max-w-[380px] rounded-card border border-line bg-surface p-24">
         <h1 className="text-20 font-semibold text-ink">Luna</h1>
-        <p className="mt-4 text-13 text-muted">Sign in to your console</p>
+        <p className="mt-4 text-13 text-muted">Sign in to Luna</p>
 
         <form onSubmit={onSubmit} className="mt-24 flex flex-col gap-16" noValidate>
           <Field
             id="username"
-            label="Username"
+            label="Email or username"
             type="text"
             value={username}
             onChange={setUsername}
@@ -70,6 +79,13 @@ export function Login() {
             {submitting ? 'Signing in…' : 'Sign in'}
           </button>
         </form>
+
+        <p className="mt-16 text-13 text-muted">
+          New here?{' '}
+          <Link to="/register" className="text-accent">
+            Register
+          </Link>
+        </p>
       </div>
     </main>
   );

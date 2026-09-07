@@ -162,6 +162,45 @@ def resolve_recipient(
     return None, problem
 
 
+def resolve_attendees(
+    session: Session, actor: User, names: Any
+) -> tuple[list[User], str | None]:
+    """
+    Works out everyone a meeting is with, from however many names were given.
+
+    An employee still only ever meets the boss, so their side needs no
+    matching. For the boss it is one or more teammates, each resolved on its
+    own so that "Nabila and Tanvir" fails on Tanvir alone rather than as a
+    whole — the model can then ask about the one it got wrong.
+    """
+    if actor.role == "EMPLOYEE":
+        boss = team_boss(session, actor)
+        if boss is None:
+            return [], "This team has no boss to meet with."
+        return [actor], None
+
+    if isinstance(names, str):
+        names = [names]
+    if not isinstance(names, list):
+        names = []
+
+    wanted = [str(n).strip() for n in names if str(n).strip()]
+    if not wanted:
+        return [], "No name was given. Ask who the meeting is with."
+
+    candidates = [m for m in team_members(session, actor) if m.id != actor.id]
+
+    people: list[User] = []
+    for name in wanted:
+        person, problem = match_member(candidates, name, "the meeting is with")
+        if person is None:
+            return [], problem
+        if person.id not in {p.id for p in people}:
+            people.append(person)
+
+    return people, None
+
+
 def resolve_counterpart(
     session: Session, actor: User, name: str | None
 ) -> tuple[User | None, str | None]:
@@ -201,7 +240,7 @@ def visible_meetings(session: Session, actor: User):
     return (
         statement.where(User.team_id == actor.team_id)
         if actor.role == "BOSS"
-        else statement.where(Meeting.user_id == actor.id)
+        else statement.where(Meeting.attendees.any(User.id == actor.id))
     )
 
 
@@ -440,21 +479,26 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "book_meeting",
             "description": (
-                "Book a meeting and notify the other person. Only call this "
-                "after the user has explicitly confirmed the person, subject, "
+                "Book one meeting and notify everyone in it. A meeting can "
+                "have several people — put them all in `people` and it books "
+                "as a single entry they all share, not one each. Only call "
+                "this after the user has explicitly confirmed who, subject, "
                 "date, time and duration you read back to them. This writes to "
-                "the calendar and sends a message — it is not reversible from "
+                "the calendar and sends messages — it is not reversible from "
                 "here, so never call it speculatively."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "person": {
-                        "type": "string",
+                    "people": {
+                        "type": "array",
+                        "items": {"type": "string"},
                         "description": (
-                            "Who the meeting is with, by name as the user said "
-                            "it. Ignored when an employee books, since their "
-                            "meetings are always with the boss."
+                            "Everyone the meeting is with, by name as the user "
+                            "said them — [\"Nabila\", \"Tanvir\"] for a "
+                            "meeting with both. Ignored when an employee "
+                            "books, since their meetings are always with the "
+                            "boss."
                         ),
                     },
                     "title": {
@@ -628,11 +672,46 @@ def realtime_tool_schemas() -> list[dict[str, Any]]:
 # --- Execution --------------------------------------------------------------
 
 
-def describe_meeting(meeting: Meeting, tz_name: str) -> dict[str, Any]:
+def other_people(meeting: Meeting, actor: User | None) -> list[str]:
+    """
+    Who the meeting is with, from where the caller is sitting.
+
+    Everyone involved except the person asking — so the boss hears "Nabila and
+    Tanvir" and Nabila hears "Rafi and Tanvir" about the very same meeting.
+    Whoever arranged it counts as involved; they are in the room too.
+    """
+    involved = list(meeting.attendees) or [meeting.user]
+    if meeting.created_by is not None:
+        involved.append(meeting.created_by)
+
+    seen: set[int] = set()
+    names: list[str] = []
+    for person in involved:
+        if person.id in seen or (actor is not None and person.id == actor.id):
+            continue
+        seen.add(person.id)
+        names.append(person.name)
+    return names
+
+
+def spoken_list(names: list[str]) -> str:
+    """"Nabila and Tanvir", "Nabila, Tanvir and Rakib" — as it is said aloud."""
+    if not names:
+        return "nobody"
+    if len(names) == 1:
+        return names[0]
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def describe_meeting(
+    meeting: Meeting, tz_name: str, actor: User | None = None
+) -> dict[str, Any]:
+    names = other_people(meeting, actor)
     return {
         "id": str(meeting.id),
         "title": meeting.title,
-        "with": meeting.user.name,
+        "with": spoken_list(names),
+        "attendees": [person.name for person in meeting.attendees],
         "booked_by": meeting.created_by.name if meeting.created_by else None,
         "when": format_local(meeting.start_at, tz_name),
         "start": iso_local(meeting.start_at, tz_name),
@@ -680,14 +759,14 @@ def _list_meetings(
     statement = (
         statement.where(User.team_id == actor.team_id)
         if actor.role == "BOSS"
-        else statement.where(Meeting.user_id == actor.id)
+        else statement.where(Meeting.attendees.any(User.id == actor.id))
     )
 
     rows = list(session.scalars(statement))
     return {
         "ok": True,
         "count": len(rows),
-        "meetings": [describe_meeting(row, tz_name) for row in rows],
+        "meetings": [describe_meeting(row, tz_name, actor) for row in rows],
     }
 
 
@@ -715,7 +794,7 @@ def _check_availability(
         "ok": True,
         "available": False,
         "when": format_local(start, tz_name),
-        "conflicts": [describe_meeting(row, tz_name) for row in conflicts],
+        "conflicts": [describe_meeting(row, tz_name, actor) for row in conflicts],
         "alternatives": suggest_slots(
             session, actor.team_id, start, duration, tz_name
         ),
@@ -725,8 +804,10 @@ def _check_availability(
 def _book_meeting(
     session: Session, actor: User, args: dict, tz_name: str
 ) -> dict:
-    counterpart, problem = resolve_counterpart(session, actor, args.get("person"))
-    if counterpart is None:
+    people, problem = resolve_attendees(
+        session, actor, args.get("people") or args.get("person")
+    )
+    if not people:
         return {"ok": False, "error": problem}
 
     try:
@@ -751,19 +832,17 @@ def _book_meeting(
             "ok": False,
             "reason": "conflict",
             "error": "That time is already taken. Offer the alternatives.",
-            "conflicts": [describe_meeting(row, tz_name) for row in conflicts],
+            "conflicts": [describe_meeting(row, tz_name, actor) for row in conflicts],
             "alternatives": suggest_slots(
                 session, actor.team_id, start, duration, tz_name
             ),
         }
 
-    # The calendar it lands on is the employee's either way: when the boss
-    # books, that is the counterpart; when an employee books, it is their own.
-    owner = counterpart if actor.role == "BOSS" else actor
-    recipient = counterpart if actor.role == "BOSS" else counterpart
-
+    # One meeting, however many people are in it. user_id is the first
+    # attendee — the team-scoping joins hang off it — and `attendees` is the
+    # whole room.
     meeting = Meeting(
-        user_id=owner.id,
+        user_id=people[0].id,
         created_by_id=actor.id,
         title=title,
         notes=notes,
@@ -771,53 +850,64 @@ def _book_meeting(
         end_at=end,
         status="CONFIRMED",
     )
+    meeting.attendees = list(people)
     session.add(meeting)
     session.flush()
 
-    # The notification is a real message in the other person's conversation,
-    # so it is waiting for them the next time they open their chat.
+    # Everyone in the room hears about it, and each is told who else is in it
+    # rather than just who called the meeting.
     detail = f" {notes}" if notes else ""
-    session.add(
-        Message(
-            user_id=recipient.id,
-            role="ASSISTANT",
-            content=(
-                f"Hey {recipient.name.split(' ')[0]} — you have a meeting with "
-                f"{actor.name}: \"{title}\" on {format_local(start, tz_name)}, "
-                f"for {duration} minutes.{detail}"
-            ),
+    for person in people:
+        others = spoken_list(other_people(meeting, person))
+        session.add(
+            Message(
+                user_id=person.id,
+                role="ASSISTANT",
+                content=(
+                    f"Hey {person.name.split(' ')[0]} — you have a meeting with "
+                    f'{others}: "{title}" on {format_local(start, tz_name)}, '
+                    f"for {duration} minutes.{detail}"
+                ),
+            )
         )
-    )
 
-    meeting.user = owner
-    meeting.created_by = actor
     return {
         "ok": True,
-        "booked": describe_meeting(meeting, tz_name),
-        "notified": recipient.name,
+        "booked": describe_meeting(meeting, tz_name, actor),
+        "notified": spoken_list([person.name for person in people]),
     }
 
 
 def _notify(session: Session, meeting: Meeting, actor: User, text: str) -> str | None:
     """
-    Tells the other side what changed.
+    Tells everyone else in the meeting what changed.
 
-    The person to tell is whoever is not doing the telling: when the boss moves
-    a meeting the employee hears about it, and when an employee moves their own
-    the boss does. Returns their name, or None when there is nobody to tell.
+    Everyone involved except whoever is doing the telling — every attendee,
+    plus whoever arranged it. With several people in a meeting this is the
+    difference between one person hearing that it moved and the room hearing.
+    Returns their names as they would be said aloud, or None when there is
+    nobody to tell.
     """
-    other = meeting.created_by if meeting.user_id == actor.id else meeting.user
-    if other is None or other.id == actor.id:
-        return None
+    involved = list(meeting.attendees) or [meeting.user]
+    if meeting.created_by is not None:
+        involved.append(meeting.created_by)
 
-    session.add(
-        Message(
-            user_id=other.id,
-            role="ASSISTANT",
-            content=f"Hey {other.name.split(' ')[0]} — {text}",
+    told: list[str] = []
+    seen: set[int] = set()
+    for person in involved:
+        if person.id == actor.id or person.id in seen:
+            continue
+        seen.add(person.id)
+        told.append(person.name)
+        session.add(
+            Message(
+                user_id=person.id,
+                role="ASSISTANT",
+                content=f"Hey {person.name.split(' ')[0]} — {text}",
+            )
         )
-    )
-    return other.name
+
+    return spoken_list(told) if told else None
 
 
 def _send_message(session: Session, actor: User, args: dict, tz_name: str) -> dict:
@@ -890,7 +980,7 @@ def _reschedule_meeting(
             "ok": False,
             "reason": "conflict",
             "error": "That time is already taken. Offer the alternatives.",
-            "conflicts": [describe_meeting(row, tz_name) for row in conflicts],
+            "conflicts": [describe_meeting(row, tz_name, actor) for row in conflicts],
             "alternatives": suggest_slots(
                 session, actor.team_id, new_start, duration, tz_name
             ),
@@ -909,7 +999,7 @@ def _reschedule_meeting(
     )
     return {
         "ok": True,
-        "moved": describe_meeting(meeting, tz_name),
+        "moved": describe_meeting(meeting, tz_name, actor),
         "was": was,
         "notified": notified,
     }
@@ -922,7 +1012,7 @@ def _cancel_meeting(session: Session, actor: User, args: dict, tz_name: str) -> 
 
     # Cancelled, not deleted: the row stays so the meeting can be accounted
     # for afterwards, and every read already filters CANCELLED out.
-    cancelled = describe_meeting(meeting, tz_name)
+    cancelled = describe_meeting(meeting, tz_name, actor)
     meeting.status = "CANCELLED"
     session.flush()
 

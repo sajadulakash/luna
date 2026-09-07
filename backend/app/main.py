@@ -5,6 +5,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import random
+import re
+import secrets
+import string
 from typing import Any
 
 from fastapi import (
@@ -23,19 +26,20 @@ from sqlalchemy.orm import Session, joinedload
 
 from .config import get_settings
 from .database import SessionLocal, get_db
-from .models import Meeting, Message, User
+from .models import Meeting, Message, Team, User
 from .schemas import (
     ChatRequest,
     CreateMeetingRequest,
     LoginRequest,
     PolicyUpdate,
     RealtimeSessionRequest,
+    RegisterRequest,
     RealtimeToolRequest,
     RealtimeTranscriptRequest,
     RescheduleMeetingRequest,
 )
 from .scheduling import POLICIES, fake_slots, iso, parse_iso
-from .security import access_token_for, verify_password
+from .security import access_token_for, hash_password, verify_password
 from .services.openai_client import OpenAIClient, OpenAIError
 from .tools import (
     TOOL_NAMES,
@@ -141,6 +145,12 @@ Ask for it instead. Checking a time nobody asked for wastes their turn.
 Every time you pass to a tool is local wall-clock in {tz_name}, formatted
 YYYY-MM-DDTHH:MM. Never send a UTC time.
 
+A meeting can have more than one person in it. "Set something up with Nabila
+and Tanvir" is one meeting they both attend, booked once with both names —
+never two separate meetings, and never one of them dropped. When you read a
+schedule back, name everyone in each meeting: "you have a review with Nabila
+and Tanvir", not "with Nabila".
+
 To book a meeting, collect four things: who it is with, what it is about,
 when it starts, and how long it runs. Ask for whatever is missing, one short
 question at a time. Then read all four back and wait for the user to confirm
@@ -184,6 +194,45 @@ and say the other person has been told.
 
 Keep replies short and spoken-friendly — this is often read aloud. Never
 claim an action a tool did not confirm."""
+
+# The departments an employee may register into. Served to the form as well
+# as checked on the way in, so the dropdown and the validation cannot drift
+# apart — a value that is not on this list is not a department, however it
+# arrived.
+DEPARTMENTS: tuple[str, ...] = (
+    "HR",
+    "Finance",
+    "Accounts",
+    "Operations",
+    "Data Analytics",
+    "Engineering",
+    "Sales",
+    "Marketing",
+    "Customer Support",
+)
+
+
+def unique_username(db: Session, first: str, last: str) -> str:
+    """
+    A private chat link that cannot be guessed from someone's name.
+
+    The username *is* the employee's credential — /chat/<username> signs them
+    in — so deriving it from the name alone would let anyone who knows a
+    colleague's name read their conversation. The random tail is what makes
+    the link private; the readable part is only there so a person can tell
+    whose link they are holding.
+    """
+    stem = re.sub(r"[^a-z0-9]+", "-", f"{first} {last}".strip().lower()).strip("-")
+    stem = (stem or "member")[:32]
+
+    alphabet = string.ascii_lowercase + string.digits
+    for _ in range(20):
+        candidate = f"{stem}-{''.join(secrets.choice(alphabet) for _ in range(6))}"
+        if db.scalar(select(User.id).where(User.username == candidate)) is None:
+            return candidate
+
+    raise HTTPException(status_code=500, detail="Could not allocate a chat link.")
+
 
 LAN_ORIGIN = (
     r"https?://(localhost|127\.0\.0\.1"
@@ -236,6 +285,9 @@ def serialize_user(user: User) -> dict[str, Any]:
         "team_id": str(user.team_id),
         "name": user.name,
         "role": user.role,
+        "email": user.email,
+        "phone": user.phone,
+        "department": user.department,
     }
 
 
@@ -265,6 +317,12 @@ def serialize_meeting(meeting: Meeting) -> dict[str, Any]:
             "id": str(creator.id),
             "name": creator.name,
         },
+        # Everyone in the meeting. One entry on the calendar however many
+        # people are in it, so the card has to be able to name them all.
+        "attendees": [
+            {"id": str(person.id), "name": person.name}
+            for person in (meeting.attendees or [meeting.user])
+        ],
     }
 
 
@@ -286,12 +344,10 @@ def user_from_authorization(
             return None
         return user
 
-    return db.scalar(
-        select(User).where(
-            User.username == token,
-            User.role == "EMPLOYEE",
-        )
-    )
+    # Nothing else is a token. A username used to be accepted here, which made
+    # anyone's chat readable to anyone who knew their name; employees have
+    # passwords now, so there is no reason to keep that door open.
+    return None
 
 
 def require_user(authorization: str | None, db: Session) -> User:
@@ -329,7 +385,7 @@ def team_meeting_statement(user: User):
     )
     if user.role == "BOSS":
         return statement.where(User.team_id == user.team_id)
-    return statement.where(Meeting.user_id == user.id)
+    return statement.where(Meeting.attendees.any(User.id == user.id))
 
 
 def meeting_for_boss(db: Session, boss: User, meeting_id: int) -> Meeting | None:
@@ -363,15 +419,25 @@ def login(
     response: Response,
     db: Session = Depends(get_db),
 ) -> Any:
+    # Either identifier, and any role: since employees have passwords there is
+    # no reason for them to sign in anywhere else.
+    identifier = body.username.strip().lower()
     user = db.scalar(
-        select(User).where(
-            User.username == body.username.strip().lower(),
-            User.role == "BOSS",
-        )
+        select(User).where((User.username == identifier) | (User.email == identifier))
     )
     if user is None or not verify_password(body.password, user.password):
-        return api_error(401, "invalid_credentials", "Check your username and password.")
+        return api_error(401, "invalid_credentials", "Check your details and try again.")
 
+    issue_refresh_cookie(response, user)
+    return {
+        "access_token": access_token_for(user.id, user.role),
+        "expires_in": 900,
+        "user": serialize_user(user),
+    }
+
+
+def issue_refresh_cookie(response: Response, user: User) -> None:
+    """The long-lived half of a session. httpOnly, so JavaScript cannot read it."""
     response.set_cookie(
         REFRESH_COOKIE,
         user.username,
@@ -381,6 +447,64 @@ def login(
         samesite="lax",
         path="/",
     )
+
+
+@app.get("/api/departments")
+def departments() -> list[str]:
+    """The dropdown's options. Public: it is needed before anyone has an account."""
+    return list(DEPARTMENTS)
+
+
+@app.post("/api/auth/register", status_code=201)
+def register(
+    body: RegisterRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> Any:
+    """
+    Signs a new employee up and signs them straight in.
+
+    Registering returns a session rather than a link to keep somewhere: the
+    next thing they see is their own chat, and the way back in afterwards is
+    the same login page everyone else uses.
+    """
+    if body.department not in DEPARTMENTS:
+        return api_error(
+            422, "unknown_department", "Choose a department from the list."
+        )
+
+    email = str(body.email).strip().lower()
+    if db.scalar(select(User.id).where(User.email == email)) is not None:
+        return api_error(
+            409, "email_taken", "Someone is already registered with that email."
+        )
+
+    # One team, and every employee joins it. A second team would need the form
+    # to say which, and there is nothing in the product that makes one yet.
+    team = db.scalar(select(Team).order_by(Team.id))
+    if team is None:
+        return api_error(503, "no_team", "There is no team to join yet.")
+
+    first = body.first_name.strip()
+    last = body.last_name.strip()
+
+    user = User(
+        team_id=team.id,
+        name=f"{first} {last}",
+        username=unique_username(db, first, last),
+        password=hash_password(body.password),
+        role="EMPLOYEE",
+        first_name=first,
+        last_name=last,
+        email=email,
+        phone=body.phone.strip(),
+        department=body.department,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    issue_refresh_cookie(response, user)
     return {
         "access_token": access_token_for(user.id, user.role),
         "expires_in": 900,
@@ -394,24 +518,11 @@ def refresh(
     luna_refresh: str | None = Cookie(default=None),
     db: Session = Depends(get_db),
 ) -> Any:
-    user = db.scalar(
-        select(User).where(
-            User.username == luna_refresh,
-            User.role == "BOSS",
-        )
-    )
+    user = db.scalar(select(User).where(User.username == luna_refresh))
     if user is None:
         return api_error(401, "invalid_session", "Sign in again.")
 
-    response.set_cookie(
-        REFRESH_COOKIE,
-        user.username,
-        max_age=7 * 24 * 60 * 60,
-        httponly=True,
-        secure=settings.app_url.startswith("https://"),
-        samesite="lax",
-        path="/",
-    )
+    issue_refresh_cookie(response, user)
     return {
         "access_token": access_token_for(user.id, user.role),
         "expires_in": 900,
@@ -966,6 +1077,7 @@ def create_meeting(
         end_at=end,
         status="CONFIRMED",
     )
+    meeting.attendees = [user]
     db.add(meeting)
     db.commit()
     db.refresh(meeting)

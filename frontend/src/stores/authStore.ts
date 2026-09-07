@@ -4,7 +4,11 @@ import * as authApi from '../api/auth';
 import type { Person } from '../api/types';
 
 /**
- * Owner session.
+ * The signed-in session, whoever it belongs to.
+ *
+ * One store for both roles: employees have passwords too, so there is no
+ * second kind of session to model. Where someone lands after signing in is a
+ * question about `user.role`, asked by the router.
  *
  * The access token lives here and nowhere else. It is never written to
  * localStorage or sessionStorage — the long-lived credential is the httpOnly
@@ -27,6 +31,8 @@ interface AuthState {
   error: string | null;
 
   login: (username: string, password: string) => Promise<boolean>;
+  /** Adopts the session that registering just handed back. */
+  adopt: (accessToken: string, user: Person) => void;
   logout: () => Promise<void>;
   /** Silent refresh on load, so a reload doesn't bounce the owner to /login. */
   restore: () => Promise<void>;
@@ -64,6 +70,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     }
   },
 
+  adopt: (accessToken, user) =>
+    set({ status: 'authenticated', accessToken, user, error: null }),
+
   logout: async () => {
     try {
       await authApi.logout();
@@ -96,7 +105,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
  * means the client has no dependency on React or Zustand and stays testable
  * on its own.
  */
-export function installOwnerAuth(onAuthFailure?: () => void): void {
+export function installSessionAuth(onAuthFailure?: () => void): void {
   configureApi({
     getAuth: () => ({ mode: 'owner', token: useAuthStore.getState().accessToken }),
 

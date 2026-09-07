@@ -18,7 +18,23 @@ export interface Person {
   team_id: string;
   name: string;
   role: Role;
+  /** Collected at registration; absent for accounts that predate it. */
+  email?: string | null;
+  phone?: string | null;
+  department?: string | null;
 }
+
+export interface RegisterRequest {
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone: string;
+  department: string;
+  password: string;
+}
+
+/** Registering signs you in, so this is the same shape as a login. */
+export type RegisterResponse = LoginResponse;
 
 export interface Meeting {
   id: string;
@@ -29,6 +45,8 @@ export interface Meeting {
   status: MeetingStatus;
   booked_via: BookedVia;
   requested_by: { id: string; name: string } | null;
+  /** Everyone in the meeting. One entry however many people are in it. */
+  attendees?: { id: string; name: string }[];
 }
 
 export interface Slot {

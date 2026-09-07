@@ -115,6 +115,7 @@ export function MeetingDetail({ meeting, onClose, editable = true }: MeetingDeta
         </div>
 
         <dl className="flex flex-col gap-12 border-t border-line py-16">
+          <Row label="With" value={attendeeNames(meeting)} />
           <Row label="Requested by" value={meeting.requested_by?.name ?? 'Rafi'} />
           <Row label="Booked via" value={bookedViaLabel(meeting.booked_via)} />
           {meeting.notes ? <Row label="Notes" value={meeting.notes} /> : null}
@@ -191,6 +192,14 @@ function Row({
       </dd>
     </div>
   );
+}
+
+/** "Nabila and Tanvir" — as it would be said aloud. */
+function attendeeNames(meeting: Meeting): string {
+  const names = (meeting.attendees ?? []).map((person) => person.name);
+  if (names.length === 0) return meeting.requested_by?.name ?? '—';
+  if (names.length === 1) return names[0]!;
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
 
 function bookedViaLabel(via: Meeting['booked_via']): string {

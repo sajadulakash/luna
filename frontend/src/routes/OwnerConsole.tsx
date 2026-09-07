@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { LogOut } from 'lucide-react';
 import type { Meeting } from '../api/types';
-import { installOwnerAuth, useAuthStore } from '../stores/authStore';
+import { useAuthStore } from '../stores/authStore';
 import { useVoiceStore } from '../stores/voiceStore';
 import { ChatPane, type ChatPaneHandle } from '../features/chat/ChatPane';
 import { WeekView } from '../features/calendar/WeekView';
@@ -53,12 +53,6 @@ export function OwnerConsole() {
     if (voiceState !== 'idle') setVoiceOpen(true);
     else if (!useVoiceStore.getState().error) setVoiceOpen(false);
   }, [voiceState]);
-
-  // The employee route puts the fetch wrapper into employee mode. Coming back
-  // here has to put it back.
-  useEffect(() => {
-    installOwnerAuth();
-  }, []);
 
   // Spoken turns are already said and already saved by the time they arrive;
   // they only need to show up in the transcript alongside the typed ones.

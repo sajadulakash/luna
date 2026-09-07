@@ -35,11 +35,12 @@ npm run dev -- --host 0.0.0.0
 - PostgreSQL persistence for teams, users, messages, and meetings
 - Alembic database migrations with automatic model-difference detection
 - One boss per team enforced by the database
-- Username/password boss login with hashed passwords and a development session
-- Username-based private employee chat links
+- One sign-in page for everyone; where you land follows your role
+- Employee self-registration that signs you in and opens your chat
 - Team-scoped boss calendar and employee-scoped calendars
 - Persistent chat history and streamed OpenAI responses
 - Calendar tool-calling: Luna reads meetings, checks a time, and books it
+- One meeting can have several people: booked once, on everyone's calendar
 - Luna can also move and cancel meetings, by voice or by typing
 - Luna passes messages on, rewriting them short and organised first
 - Meetings are named by time and person, never by an id read aloud
@@ -47,6 +48,7 @@ npm run dev -- --host 0.0.0.0
 - Read-back and explicit confirmation before anything is written or undone
 - The other person is messaged when a meeting is booked, moved or cancelled
 - Passed-on messages arrive under the sender's name, not Luna's
+- Meetings read back naming everyone in them, from the listener's side
 - Spoken wall-clock times resolved in the caller's timezone, stored as UTC
 - Environment-configurable chat, realtime, transcription and voice
 - Speech-to-speech voice mode over WebRTC — one model hears and answers
@@ -121,14 +123,18 @@ The development database has four tables:
 
 ```text
 teams
-└── users
+└── users                      # name, email, phone, department
     ├── messages
-    └── meetings
+    └── meetings ── meeting_attendees ── users
 ```
 
-A meeting names two people. `user_id` is whose calendar it sits on, and
-`created_by_id` is who arranged it. When Rafi books time with Rakib, the meeting
-belongs to Rakib's calendar while still crediting Rafi as the requester.
+A meeting names the people in it. `meeting_attendees` is who is in the room —
+there can be several, so "the review with Nabila and Tanvir" is one entry on
+the calendar rather than two. `created_by_id` is who arranged it, and
+`user_id` is the first attendee, which the team-scoping queries join through.
+
+Meetings are read back from the listener's side: the boss hears "with Nabila
+and Tanvir", and Nabila hears "with Tanvir and Rafi" about the same meeting.
 
 `setup_database.py` is repeatable. It creates the database when missing,
 upgrades it to the latest Alembic revision, and inserts or refreshes the dummy
@@ -136,12 +142,17 @@ data.
 
 Development access:
 
+Everyone signs in at `/login`, with an email address or a username. The boss
+lands on the console, employees land on their own chat, and signing out returns
+to the login page. Registering at `/register` is itself a sign-in: it opens the
+new employee's chat straight away.
+
 | Name | Username | Password | Role | Access |
 | --- | --- | --- | --- | --- |
-| Rafi | `rafi` | `luna123` | Boss | `/login` |
-| Rakib | `rakib` | `luna123` | Employee | `/chat/rakib` |
-| Nabila | `nabila` | `luna123` | Employee | `/chat/nabila` |
-| Tanvir | `tanvir` | `luna123` | Employee | `/chat/tanvir` |
+| Rafi | `rafi` | `luna123` | Boss | `/login` → `/` |
+| Rakib | `rakib` | `luna123` | Employee | `/login` → `/chat` |
+| Nabila | `nabila` | `luna123` | Employee | `/login` → `/chat` |
+| Tanvir | `tanvir` | `luna123` | Employee | `/login` → `/chat` |
 
 ```bash
 .venv/bin/alembic -c alembic.ini revision --autogenerate -m "describe change"

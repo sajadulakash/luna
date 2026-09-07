@@ -4,10 +4,12 @@ from datetime import datetime
 
 from sqlalchemy import (
     CheckConstraint,
+    Column,
     DateTime,
     ForeignKey,
     Index,
     String,
+    Table,
     Text,
     func,
     text,
@@ -17,6 +19,26 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase):
     pass
+
+
+# Who is in a meeting. A meeting names a time; this names the people, and
+# there can be several of them — "the review with Nabila and Tanvir" is one
+# entry on the calendar, not two.
+meeting_attendees = Table(
+    "meeting_attendees",
+    Base.metadata,
+    Column(
+        "meeting_id",
+        ForeignKey("meetings.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "user_id",
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    ),
+)
 
 
 class Team(Base):
@@ -41,6 +63,14 @@ class User(Base):
             unique=True,
             postgresql_where=text("role = 'BOSS'"),
         ),
+        # Unique where present, so the rows that have no email do not all
+        # collide with one another on NULL.
+        Index(
+            "uq_users_email",
+            "email",
+            unique=True,
+            postgresql_where=text("email IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -53,6 +83,14 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     password: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    # Filled in at registration. Nullable because the seeded users predate it,
+    # and because an employee is usable with nothing but a name and a link.
+    first_name: Mapped[str | None] = mapped_column(String(60))
+    last_name: Mapped[str | None] = mapped_column(String(60))
+    email: Mapped[str | None] = mapped_column(String(255))
+    phone: Mapped[str | None] = mapped_column(String(40))
+    department: Mapped[str | None] = mapped_column(String(60))
 
     team: Mapped[Team] = relationship(back_populates="users")
     messages: Mapped[list["Message"]] = relationship(
@@ -134,3 +172,12 @@ class Meeting(Base):
         foreign_keys=[user_id],
     )
     created_by: Mapped[User | None] = relationship(foreign_keys=[created_by_id])
+    # Everyone in the meeting, including the primary attendee above. This is
+    # what "is it on my calendar" asks; user_id survives because the team
+    # scoping joins through it and because a meeting always has a first
+    # attendee worth naming.
+    attendees: Mapped[list[User]] = relationship(
+        secondary=meeting_attendees,
+        lazy="selectin",
+        order_by="User.name",
+    )

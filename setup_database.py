@@ -72,7 +72,7 @@ def main() -> None:
     counts = seed_database()
     print("Seeded data:", ", ".join(f"{name}={count}" for name, count in counts.items()))
     print("Boss login: rafi / value of LUNA_DUMMY_PASSWORD (default: luna123)")
-    print("Employee links: /chat/rakib, /chat/nabila, /chat/tanvir")
+    print("Employees sign in at /login too: rakib, nabila, tanvir")
 
 
 if __name__ == "__main__":

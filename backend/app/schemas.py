@@ -2,12 +2,30 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
 
 class LoginRequest(BaseModel):
-    username: str = Field(min_length=1, max_length=50)
+    """`username` accepts either a username or an email address."""
+
+    username: str = Field(min_length=1, max_length=255)
     password: str = Field(min_length=1, max_length=200)
+
+
+class RegisterRequest(BaseModel):
+    """
+    A new employee signing themselves up.
+
+    The department is checked against the server's own list rather than
+    trusted from the dropdown.
+    """
+
+    first_name: str = Field(min_length=1, max_length=60)
+    last_name: str = Field(min_length=1, max_length=60)
+    email: EmailStr
+    phone: str = Field(min_length=4, max_length=40)
+    department: str = Field(min_length=1, max_length=60)
+    password: str = Field(min_length=8, max_length=200)
 
 
 class ChatRequest(BaseModel):

@@ -1,55 +1,31 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { LogOut } from 'lucide-react';
-import { useNavigate, useParams } from 'react-router-dom';
-import { useQueryClient } from '@tanstack/react-query';
-import { configureApi } from '../api/client';
 import type { Meeting } from '../api/types';
-import { queryKeys } from '../api/meetings';
+import { useAuthStore } from '../stores/authStore';
 import { ChatPane } from '../features/chat/ChatPane';
-import { ScreenMessage } from '../components/ScreenMessage';
 import { ViewTabs, type ViewTab } from '../components/ViewTabs';
 import { WeekView } from '../features/calendar/WeekView';
 import { MeetingDetail } from '../features/calendar/MeetingDetail';
 
 /**
- * /chat/:token — the employee's chat.
+ * /chat — the employee's own screen.
  *
- * The token is in the URL and goes out as a bearer token. There is no login,
- * no refresh and no retry: if the API rejects it, the link is dead and the
- * only honest thing to show is that it is dead.
+ * An ordinary signed-in page: the session comes from the auth store, the same
+ * as the console, and signing out returns to the login page. There is no link
+ * to keep and no separate way in.
  *
- * Chat and a token-scoped calendar share the same compact tab header as the
- * owner console. The calendar is read-only: employees can see meetings the
- * owner books for them without receiving owner management controls.
+ * Chat and a calendar share the compact tab header. The calendar is read-only:
+ * employees see the meetings arranged for them without the owner's controls.
  */
 export function EmployeeChat() {
-  const { token = null } = useParams<{ token: string }>();
-  const navigate = useNavigate();
-  const queryClient = useQueryClient();
+  const accessToken = useAuthStore((s) => s.accessToken);
+  const user = useAuthStore((s) => s.user);
+  const logout = useAuthStore((s) => s.logout);
+
   const [tab, setTab] = useState<ViewTab>('chat');
   const [selected, setSelected] = useState<Meeting | null>(null);
 
-  // Switches the fetch wrapper into employee mode for this route: a 401 here
-  // must not attempt a refresh, because employees have no session to refresh.
-  useEffect(() => {
-    configureApi({ getAuth: () => ({ mode: 'employee', token }) });
-  }, [token]);
-
-  if (!token) {
-    return (
-      <ScreenMessage
-        title="This link isn't valid any more."
-        body="Ask Rafi for a new one."
-      />
-    );
-  }
-
-  const leaveChat = () => {
-    queryClient.removeQueries({ queryKey: queryKeys.chatHistory(token) });
-    queryClient.removeQueries({ queryKey: queryKeys.employeeMeetings(token) });
-    configureApi({ getAuth: () => ({ mode: 'employee', token: null }) });
-    navigate('/chat-ended', { replace: true });
-  };
+  const firstName = user?.name.split(' ')[0] ?? 'there';
 
   return (
     <main className="h-app bg-bg px-safe">
@@ -58,8 +34,8 @@ export function EmployeeChat() {
           <ViewTabs active={tab} onChange={setTab} className="flex-1" />
           <button
             type="button"
-            onClick={leaveChat}
-            aria-label="Leave employee chat"
+            onClick={() => void logout()}
+            aria-label="Sign out"
             className="tap flex shrink-0 items-center justify-center px-16 text-faint transition-colors duration-150 ease-out hover:text-ink"
           >
             <LogOut size={18} aria-hidden="true" />
@@ -69,19 +45,13 @@ export function EmployeeChat() {
         <div className="min-h-0 flex-1">
           {tab === 'chat' ? (
             <ChatPane
-              token={token}
-              greeting="Hi — I'm Luna, Rafi's assistant. When would you like to meet?"
+              token={accessToken}
+              greeting={`Hi ${firstName} — I'm Luna. When would you like to meet?`}
               slotsTappable
               composerPlaceholder="Message Luna"
-              renderDeadLink={() => (
-                <ScreenMessage
-                  title="This link isn't valid any more."
-                  body="Ask Rafi for a new one."
-                />
-              )}
             />
           ) : (
-            <WeekView token={token} onSelectMeeting={setSelected} />
+            <WeekView token={accessToken} onSelectMeeting={setSelected} />
           )}
         </div>
       </div>

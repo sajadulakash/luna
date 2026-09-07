@@ -5,31 +5,31 @@ import { useAppHeight } from './lib/useAppHeight';
 import { EmployeeChat } from './routes/EmployeeChat';
 import { OwnerConsole } from './routes/OwnerConsole';
 import { Login } from './routes/Login';
+import { Register } from './routes/Register';
 import { ScreenMessage } from './components/ScreenMessage';
 
-/** Three routes only. */
+/** Login, register, the owner console, and an employee's chat. */
 export function App() {
   useAppHeight();
 
   return (
     <Routes>
-      <Route path="/chat/:token" element={<EmployeeChat />} />
       <Route
-        path="/chat-ended"
+        path="/chat"
         element={
-          <ScreenMessage
-            title="You've left the chat."
-            body="You can safely close this tab."
-          />
+          <RequireAuth role="EMPLOYEE">
+            <EmployeeChat />
+          </RequireAuth>
         }
       />
       <Route path="/login" element={<Login />} />
+      <Route path="/register" element={<Register />} />
       <Route
         path="/"
         element={
-          <RequireOwner>
+          <RequireAuth role="BOSS">
             <OwnerConsole />
-          </RequireOwner>
+          </RequireAuth>
         }
       />
       <Route path="*" element={<Navigate to="/" replace />} />
@@ -38,14 +38,25 @@ export function App() {
 }
 
 /**
- * The owner's guard.
+ * The guard on both signed-in areas.
  *
  * A reload starts with no access token — it lives in memory by design — so
  * the first thing to try is a silent refresh against the httpOnly cookie.
- * Only when that fails does the owner see /login.
+ * Only when that fails does anyone see /login.
+ *
+ * Landing on the wrong area is a redirect rather than a refusal: an employee
+ * who opens / belongs in the chat, and the boss who opens /chat belongs in
+ * the console.
  */
-function RequireOwner({ children }: { children: React.ReactNode }) {
+function RequireAuth({
+  role,
+  children,
+}: {
+  role: 'BOSS' | 'EMPLOYEE';
+  children: React.ReactNode;
+}) {
   const status = useAuthStore((s) => s.status);
+  const user = useAuthStore((s) => s.user);
   const restore = useAuthStore((s) => s.restore);
 
   useEffect(() => {
@@ -56,9 +67,18 @@ function RequireOwner({ children }: { children: React.ReactNode }) {
     return <ScreenMessage title="One moment…" />;
   }
 
-  if (status === 'anonymous') {
+  if (status === 'anonymous' || !user) {
     return <Navigate to="/login" replace />;
   }
 
+  if (user.role !== role) {
+    return <Navigate to={homeFor(user.role)} replace />;
+  }
+
   return <>{children}</>;
+}
+
+/** Where someone belongs once signed in. */
+export function homeFor(role: 'BOSS' | 'EMPLOYEE'): string {
+  return role === 'BOSS' ? '/' : '/chat';
 }
