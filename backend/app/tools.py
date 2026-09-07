@@ -69,6 +69,22 @@ def iso_local(value: datetime, tz_name: str) -> str:
     return value.astimezone(zone(tz_name)).strftime("%Y-%m-%dT%H:%M")
 
 
+# Titles people put in front of their name. "Md. Rafi Hasnain" is Rafi, not
+# Md. — greeting someone by their honorific reads like a form letter.
+HONORIFICS = frozenset(
+    {"md", "mohammad", "muhammad", "mr", "mrs", "ms", "miss", "dr", "prof", "eng"}
+)
+
+
+def first_name_of(name: str) -> str:
+    """What to call someone, from however their full name is written."""
+    parts = [part for part in name.replace(".", " ").split() if part]
+    for part in parts:
+        if part.lower() not in HONORIFICS:
+            return part
+    return parts[0] if parts else name
+
+
 # --- Lookups ----------------------------------------------------------------
 
 
@@ -122,6 +138,82 @@ def match_member(
 
     known = ", ".join(member.name for member in candidates) or "nobody"
     return None, f"There is no '{name}' on this team. The team is: {known}."
+
+
+def resolve_recipients(
+    session: Session, actor: User, args: dict
+) -> tuple[list[User], str | None]:
+    """
+    Everyone a message is going to, from however it was addressed.
+
+    One message can reach one person, several named people, a whole
+    department, or the team. They are separate arguments rather than one
+    clever field because "Engineering" and a person called Engineering are not
+    the same question, and guessing between them would eventually send
+    something to the wrong room.
+
+    Employees still write only to the boss, so their side is not addressed at
+    all — the same rule that governs who they can meet.
+    """
+    if actor.role != "BOSS":
+        person, problem = resolve_recipient(session, actor, args.get("person"))
+        return ([person], None) if person else ([], problem)
+
+    everyone = [m for m in team_members(session, actor) if m.id != actor.id]
+
+    if args.get("everyone"):
+        if not everyone:
+            return [], "There is nobody else on the team."
+        return everyone, None
+
+    department = (args.get("department") or "").strip().lower()
+    if department:
+        # People say "the engineering team", not "Engineering". Strip the words
+        # that mean "group of" and match either way round, so a department name
+        # that is itself longer than what was said still lands.
+        for filler in (" team", " department", " dept", " group"):
+            if department.endswith(filler):
+                department = department[: -len(filler)].strip()
+
+        matched = [
+            m
+            for m in everyone
+            if m.department
+            and (
+                department in m.department.lower()
+                or m.department.lower() in department
+            )
+        ]
+        if not matched:
+            staffed = sorted(
+                {m.department for m in everyone if m.department}
+            )
+            known = ", ".join(staffed) if staffed else "none yet"
+            return [], (
+                f"Nobody is in '{args['department']}'. Departments with "
+                f"people in them: {known}."
+            )
+        return matched, None
+
+    names = args.get("people") or args.get("person")
+    if isinstance(names, str):
+        names = [names]
+    if not isinstance(names, list):
+        names = []
+
+    wanted = [str(n).strip() for n in names if str(n).strip()]
+    if not wanted:
+        return [], "No name was given. Ask who the message is for."
+
+    people: list[User] = []
+    for name in wanted:
+        person, problem = resolve_recipient(session, actor, name)
+        if person is None:
+            return [], problem
+        if person.id not in {p.id for p in people}:
+            people.append(person)
+
+    return people, None
 
 
 def resolve_recipient(
@@ -533,7 +625,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "send_message",
             "description": (
-                "Pass a message to someone on the team. It lands in their chat "
+                "Pass a message to one person, several people, a whole "
+                "department, or the entire team. Address it exactly one way: "
+                "`person` for one, `people` for named individuals, "
+                "`department` for everyone in a department, or `everyone` for "
+                "the whole team. It lands in their chat "
                 "with Luna, attributed to the person who sent it. Write the "
                 "message yourself: take what the user said, or what you have "
                 "just been discussing, and put it in short, clear, organised "
@@ -547,7 +643,27 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "person": {
                         "type": "string",
-                        "description": "Who it is for, by name as the user said it.",
+                        "description": "One recipient, by name as the user said it.",
+                    },
+                    "people": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Several named recipients, e.g. "
+                            "[\"Nabila\", \"Tanvir\"]."
+                        ),
+                    },
+                    "department": {
+                        "type": "string",
+                        "description": (
+                            "Everyone in one department, e.g. \"Engineering\" "
+                            "for \"tell the engineering team\". Use this "
+                            "rather than listing the members yourself."
+                        ),
+                    },
+                    "everyone": {
+                        "type": "boolean",
+                        "description": "True to send it to the whole team.",
                     },
                     "message": {
                         "type": "string",
@@ -558,7 +674,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         ),
                     },
                 },
-                "required": ["person", "message"],
+                "required": ["message"],
             },
         },
     },
@@ -967,8 +1083,8 @@ def _notify(
 
 
 def _send_message(session: Session, actor: User, args: dict, tz_name: str) -> dict:
-    recipient, problem = resolve_recipient(session, actor, args.get("person"))
-    if recipient is None:
+    recipients, problem = resolve_recipients(session, actor, args)
+    if not recipients:
         return {"ok": False, "error": problem}
 
     body = (args.get("message") or "").strip()
@@ -980,22 +1096,31 @@ def _send_message(session: Session, actor: User, args: dict, tz_name: str) -> di
             "error": "That is too long to pass on. Ask them to shorten it.",
         }
 
-    # Attributed, not ventriloquised. The recipient has to be able to tell
-    # that this came from a person, and which one — Luna is carrying it, not
-    # deciding it.
-    session.add(
-        Message(
-            user_id=recipient.id,
-            role="ASSISTANT",
-            content=(
-                f"Hey {recipient.name.split(' ')[0]} — {actor.name} asked me to "
-                f"pass this on:\n\n{body}"
-            ),
+    # One message, delivered to each of them. Attributed, not ventriloquised:
+    # the recipient has to be able to tell that this came from a person, and
+    # which one — Luna is carrying it, not deciding it.
+    for person in recipients:
+        session.add(
+            Message(
+                user_id=person.id,
+                role="ASSISTANT",
+                content=(
+                    f"Hey {first_name_of(person.name)} — {actor.name} asked me to "
+                    f"pass this on:\n\n{body}"
+                ),
+            )
         )
-    )
+        # And in the panel, so it is visible without opening the chat.
+        notify(session, person, "MESSAGE", f"{actor.name}: {body}")
+
     session.flush()
 
-    return {"ok": True, "sent_to": recipient.name, "message": body}
+    return {
+        "ok": True,
+        "sent_to": spoken_list([person.name for person in recipients]),
+        "count": len(recipients),
+        "message": body,
+    }
 
 
 def _reschedule_meeting(

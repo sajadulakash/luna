@@ -43,6 +43,7 @@ npm run dev -- --host 0.0.0.0
 - One meeting can have several people: booked once, on everyone's calendar
 - Luna can also move and cancel meetings, by voice or by typing
 - Luna passes messages on, rewriting them short and organised first
+- One message can go to a person, a department, or the whole team
 - Meetings are named by time and person, never by an id read aloud
 - Conflict detection offering real free slots inside working hours
 - Read-back and explicit confirmation before anything is written or undone

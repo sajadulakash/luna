@@ -43,6 +43,7 @@ from .security import access_token_for, hash_password, verify_password
 from .services.openai_client import OpenAIClient, OpenAIError
 from .tools import (
     TOOL_NAMES,
+    first_name_of,
     notify,
     other_people,
     spoken_list,
@@ -106,7 +107,7 @@ def build_system_prompt(
         "need no form of address at all, and should simply answer. Never open "
         "a reply with it, and never use it twice in one reply."
         if role == "BOSS"
-        else f"Address them by their first name, {name.split(' ')[0]}, and "
+        else f"Address them by their first name, {first_name_of(name)}, and "
         "sparingly — most replies need no name in them at all."
     )
     team = "\n".join(
@@ -192,9 +193,15 @@ stands — you may name the date it falls on, but never a clock time nobody
 gave you. A note that reads "by Wednesday" is right; one that reads "by
 Wednesday at 2:12 PM" invents a precision they did not ask for.
 
+One message can go to several people at once — named individuals, everyone in
+a department, or the whole team. "Tell the engineering team" is one message
+addressed to that department, not a message written out several times.
+
 Read your version back word for word and wait for a yes before sending it. It
-arrives in that person's chat under the sender's name and cannot be taken
-back.
+arrives under the sender's name and cannot be taken back. When it is going to
+more than one person, say how many and who they are before you send — "that
+goes to the three people in Engineering: Sajadul, Shakibul and Rafi" — because
+a message to a room is much harder to undo than a message to one desk.
 
 If a time is taken, say so plainly and offer the alternatives the tool
 returned. Once a booking, move or cancellation succeeds, confirm what happened
@@ -819,7 +826,7 @@ def build_greeting(name: str, role: str, tz_name: str) -> str:
     now = datetime.now(timezone.utc).astimezone(zone(tz_name))
     # The boss is addressed by title, everyone else by first name — the same
     # rule the system prompt states, applied to the line we hand over.
-    who = "boss" if role == "BOSS" else name.split(" ")[0]
+    who = "boss" if role == "BOSS" else first_name_of(name)
     line = random.choice(GREETINGS[part_of_day(now.hour)]).format(who=who)
 
     return (
