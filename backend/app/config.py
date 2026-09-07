@@ -18,6 +18,12 @@ class Settings:
     openai_api_key: str
     openai_base_url: str
     openai_chat_model: str
+    # Both optional, because the newer chat models refuse them. gpt-5.5 rejects
+    # any temperature but 1; gpt-5.6 requires reasoning_effort to be stated as
+    # "none" before it will accept function tools at all. Left blank, neither
+    # is sent, which is what every model accepts.
+    openai_temperature: float | None
+    openai_reasoning_effort: str
     # The speech-to-speech model behind voice mode. It hears and speaks
     # directly — there is no separate transcription or synthesis step.
     openai_realtime_model: str
@@ -51,6 +57,18 @@ class Settings:
     openai_project_id: str
     app_url: str
     allowed_origins: tuple[str, ...]
+
+
+def _optional_float_env(name: str) -> float | None:
+    """A knob that is off when blank, rather than defaulted to something."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"{name}={raw!r} is not a number; leaving it unset.")
+        return None
 
 
 def _float_env(name: str, fallback: float) -> float:
@@ -89,7 +107,9 @@ def get_settings() -> Settings:
         openai_base_url=os.getenv(
             "OPENAI_BASE_URL", "https://api.openai.com/v1"
         ).rstrip("/"),
-        openai_chat_model=os.getenv("OPENAI_CHAT_MODEL", "gpt-5.4-mini"),
+        openai_chat_model=os.getenv("OPENAI_CHAT_MODEL", "gpt-5.5"),
+        openai_temperature=_optional_float_env("OPENAI_TEMPERATURE"),
+        openai_reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "").strip(),
         openai_realtime_model=os.getenv(
             "OPENAI_REALTIME_MODEL", "gpt-realtime-2.1"
         ),

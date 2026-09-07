@@ -62,8 +62,15 @@ class OpenAIClient:
             "model": self.settings.openai_chat_model,
             "messages": messages,
             "stream": True,
-            "temperature": 0.4,
         }
+        # Sent only when configured. The newer models reject a temperature
+        # they did not choose, and refuse function tools unless the reasoning
+        # effort is named — so which of these is set depends on the model, and
+        # hardcoding either one rules half of them out.
+        if self.settings.openai_temperature is not None:
+            payload["temperature"] = self.settings.openai_temperature
+        if self.settings.openai_reasoning_effort:
+            payload["reasoning_effort"] = self.settings.openai_reasoning_effort
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"

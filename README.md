@@ -111,6 +111,27 @@ it returns the same sentence four times.
 Voice and text share one system prompt and one set of tools, derived from the
 same definitions, so the two cannot drift apart.
 
+### Choosing models
+
+`OPENAI_CHAT_MODEL` drives the typed chat; `OPENAI_REALTIME_MODEL` drives
+voice. The newer chat models disagree about two parameters, so both are
+environment variables and neither is sent when blank:
+
+| Model | `OPENAI_TEMPERATURE` | `OPENAI_REASONING_EFFORT` |
+| --- | --- | --- |
+| `gpt-5.5` (default) | blank — it rejects any other | blank |
+| `gpt-5.6-luna` / `-sol` / `-terra` | blank | `none` |
+| `gpt-5.4`, `gpt-5.4-mini` | `0.4` or blank | blank |
+
+Higher reasoning is not available to Luna, and this is worth knowing before
+reaching for it: any `reasoning_effort` above `none` is rejected outright when
+function tools are attached, on every model tested. Luna cannot work without
+her tools, so the choice is a bigger base model rather than a thinking one.
+
+`gpt-5.4-pro` and `gpt-5.5-pro` are not chat models at all and cannot be used
+here. For voice, `gpt-realtime-2.1` is already the most capable realtime model
+released — there is nothing above it to move to.
+
 ### Tuning for the room
 
 The defaults assume one person speaking English into a phone or a headset. All
